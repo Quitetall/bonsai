@@ -26,8 +26,18 @@ pub struct Range {
 impl Range {
     fn from_scip(r: &[i32]) -> Option<Range> {
         match r.len() {
-            3 => Some(Range { sl: r[0], sc: r[1], el: r[0], ec: r[2] }),
-            n if n >= 4 => Some(Range { sl: r[0], sc: r[1], el: r[2], ec: r[3] }),
+            3 => Some(Range {
+                sl: r[0],
+                sc: r[1],
+                el: r[0],
+                ec: r[2],
+            }),
+            n if n >= 4 => Some(Range {
+                sl: r[0],
+                sc: r[1],
+                el: r[2],
+                ec: r[3],
+            }),
             _ => None,
         }
     }
@@ -95,7 +105,9 @@ impl CodeGraph {
                 if !is_def || occ.symbol.is_empty() || is_local_scope(&occ.symbol) {
                     continue;
                 }
-                let Some(def) = Range::from_scip(&occ.range) else { continue };
+                let Some(def) = Range::from_scip(&occ.range) else {
+                    continue;
+                };
                 let enclosing = Range::from_scip(&occ.enclosing_range).unwrap_or(def);
                 // display_name/kind/is_impl come from the doc's symbol table when present.
                 let info = doc.symbols.iter().find(|s| s.symbol == occ.symbol);
@@ -106,9 +118,19 @@ impl CodeGraph {
                     .unwrap_or(false);
                 g.symbols.insert(
                     occ.symbol.clone(),
-                    Sym { display, kind, file: file.clone(), def, enclosing, is_impl },
+                    Sym {
+                        display,
+                        kind,
+                        file: file.clone(),
+                        def,
+                        enclosing,
+                        is_impl,
+                    },
                 );
-                enclosers.entry(file.clone()).or_default().push((occ.symbol.clone(), enclosing));
+                enclosers
+                    .entry(file.clone())
+                    .or_default()
+                    .push((occ.symbol.clone(), enclosing));
             }
         }
         // Innermost-first so attribution picks the tightest enclosing definition.
@@ -126,15 +148,22 @@ impl CodeGraph {
                 }
                 g.occurrences += 1;
                 // only edges *between local symbols* matter for the intra-crate graph
-                let Some(target) = g.symbols.get(&occ.symbol) else { continue };
+                let Some(target) = g.symbols.get(&occ.symbol) else {
+                    continue;
+                };
                 let target_file = target.file.clone();
-                let Some(start) = Range::from_scip(&occ.range) else { continue };
+                let Some(start) = Range::from_scip(&occ.range) else {
+                    continue;
+                };
                 if let Some(list) = table {
                     if let Some((from_sym, _)) =
                         list.iter().find(|(_, r)| r.contains(start.sl, start.sc))
                     {
                         if from_sym != &occ.symbol {
-                            g.refs.entry(from_sym.clone()).or_default().insert(occ.symbol.clone());
+                            g.refs
+                                .entry(from_sym.clone())
+                                .or_default()
+                                .insert(occ.symbol.clone());
                         }
                     }
                 }
@@ -142,7 +171,10 @@ impl CodeGraph {
                 // edges, not coupling — excluding them keeps the dependency DAG (and the
                 // misplacement fold that reads its reverse edges) about real usage.
                 if *file != target_file && target.kind != KIND_MODULE {
-                    g.file_deps.entry(file.clone()).or_default().insert(target_file);
+                    g.file_deps
+                        .entry(file.clone())
+                        .or_default()
+                        .insert(target_file);
                 }
             }
         }
@@ -202,7 +234,9 @@ impl CodeGraph {
                     .entry(s.file.clone())
                     .or_insert_with(|| test_region_start(root, &s.file));
                 // keep only symbols defined BEFORE any #[cfg(test)] region
-                cutoff.map(|line| (s.def.sl.max(0) as usize) < line).unwrap_or(true)
+                cutoff
+                    .map(|line| (s.def.sl.max(0) as usize) < line)
+                    .unwrap_or(true)
             })
             .collect();
         dead.sort_by(|a, b| (&a.file, a.def.sl).cmp(&(&b.file, b.def.sl)));
@@ -333,13 +367,16 @@ mod tests {
         let mut a = Document::new();
         a.relative_path = "a.rs".into();
         // foo defined at line 0, body spans lines 0..5
-        a.occurrences.push(occ("foo#", vec![0, 3, 0, 6], true, vec![0, 0, 5, 0]));
+        a.occurrences
+            .push(occ("foo#", vec![0, 3, 0, 6], true, vec![0, 0, 5, 0]));
 
         let mut b = Document::new();
         b.relative_path = "b.rs".into();
         // bar defined lines 0..5; reference to foo at line 2
-        b.occurrences.push(occ("bar#", vec![0, 3, 0, 6], true, vec![0, 0, 5, 0]));
-        b.occurrences.push(occ("foo#", vec![2, 8, 2, 11], false, vec![]));
+        b.occurrences
+            .push(occ("bar#", vec![0, 3, 0, 6], true, vec![0, 0, 5, 0]));
+        b.occurrences
+            .push(occ("foo#", vec![2, 8, 2, 11], false, vec![]));
 
         let mut idx = Index::new();
         idx.documents.push(a);
@@ -347,8 +384,19 @@ mod tests {
 
         let g = CodeGraph::from_index(&idx);
         assert!(g.symbols.contains_key("foo#") && g.symbols.contains_key("bar#"));
-        assert!(g.refs.get("bar#").map(|s| s.contains("foo#")).unwrap_or(false), "{:?}", g.refs);
-        assert!(g.file_deps.get("b.rs").map(|s| s.contains("a.rs")).unwrap_or(false));
+        assert!(
+            g.refs
+                .get("bar#")
+                .map(|s| s.contains("foo#"))
+                .unwrap_or(false),
+            "{:?}",
+            g.refs
+        );
+        assert!(g
+            .file_deps
+            .get("b.rs")
+            .map(|s| s.contains("a.rs"))
+            .unwrap_or(false));
         // foo is referenced; bar is not → reachable from {bar} includes foo
         let entry: BTreeSet<String> = ["bar#".to_string()].into_iter().collect();
         let reach = g.reachable(&entry);
@@ -361,7 +409,8 @@ mod tests {
         // That is containment, not coupling → no file-dep edge, so a.rs is not "misplaced".
         let mut a = Document::new();
         a.relative_path = "a.rs".into();
-        a.occurrences.push(occ("m#", vec![0, 4, 0, 5], true, vec![0, 0, 3, 0]));
+        a.occurrences
+            .push(occ("m#", vec![0, 4, 0, 5], true, vec![0, 0, 3, 0]));
         let mut minfo = scip::types::SymbolInformation::new();
         minfo.symbol = "m#".into();
         minfo.kind = scip::types::symbol_information::Kind::Module.into();
@@ -369,14 +418,20 @@ mod tests {
 
         let mut b = Document::new();
         b.relative_path = "b.rs".into();
-        b.occurrences.push(occ("root#", vec![0, 0, 0, 4], true, vec![0, 0, 5, 0]));
-        b.occurrences.push(occ("m#", vec![1, 4, 1, 5], false, vec![])); // `mod m;`
+        b.occurrences
+            .push(occ("root#", vec![0, 0, 0, 4], true, vec![0, 0, 5, 0]));
+        b.occurrences
+            .push(occ("m#", vec![1, 4, 1, 5], false, vec![])); // `mod m;`
 
         let mut idx = Index::new();
         idx.documents.push(a);
         idx.documents.push(b);
         let g = CodeGraph::from_index(&idx);
-        assert!(g.file_deps.is_empty(), "module edge leaked into coupling: {:?}", g.file_deps);
+        assert!(
+            g.file_deps.is_empty(),
+            "module edge leaked into coupling: {:?}",
+            g.file_deps
+        );
         assert!(g.misplacements().is_empty());
     }
 
@@ -402,14 +457,18 @@ mod tests {
             .entry("util/other.rs".into())
             .or_default()
             .insert("util/helper.rs".into());
-        assert!(g.misplacements().is_empty(), "shared util must not be flagged");
+        assert!(
+            g.misplacements().is_empty(),
+            "shared util must not be flagged"
+        );
     }
 
     #[test]
     fn drops_local_scope_symbols() {
         let mut d = Document::new();
         d.relative_path = "a.rs".into();
-        d.occurrences.push(occ("local 1", vec![1, 0, 1, 3], true, vec![]));
+        d.occurrences
+            .push(occ("local 1", vec![1, 0, 1, 3], true, vec![]));
         let mut idx = Index::new();
         idx.documents.push(d);
         let g = CodeGraph::from_index(&idx);

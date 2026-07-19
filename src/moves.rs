@@ -505,21 +505,21 @@ mod tests {
         assert!(plan
             .edits
             .iter()
-            .any(|e| e.path == PathBuf::from("src/a.rs")
+            .any(|e| e.path == Path::new("src/a.rs")
                 && e.kind == EditKind::Delete
                 && e.before.contains("mod b")));
         // mod b added to util.rs
         assert!(plan
             .edits
             .iter()
-            .any(|e| e.path == PathBuf::from("src/util.rs")
+            .any(|e| e.path == Path::new("src/util.rs")
                 && e.kind == EditKind::Insert
                 && e.after.contains("mod b")));
         // crate::a::b → crate::util::b in util.rs
         assert!(plan
             .edits
             .iter()
-            .any(|e| e.path == PathBuf::from("src/util.rs")
+            .any(|e| e.path == Path::new("src/util.rs")
                 && e.kind == EditKind::Replace
                 && e.after.contains("crate::util::b::Widget")));
     }

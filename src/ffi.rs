@@ -67,7 +67,9 @@ pub fn scan(root: &Path) -> FfiGraph {
 
     for rel in crate::walk::files_with_ext(root, &[], &["rs", "py"]) {
         let relstr = rel.to_string_lossy().to_string();
-        let Ok(text) = std::fs::read_to_string(root.join(&rel)) else { continue };
+        let Ok(text) = std::fs::read_to_string(root.join(&rel)) else {
+            continue;
+        };
         match rel.extension().and_then(|e| e.to_str()) {
             Some("rs") => scan_rust(&text, &relstr, &mut g.exports, &mut module_file),
             Some("py") => scan_python(&text, &relstr, &mut g.imports),
@@ -133,7 +135,9 @@ fn scan_rust(
             if let Some(rust_name) = ident {
                 let py_name = name_override.take().unwrap_or_else(|| rust_name.clone());
                 if kind == ExportKind::Module {
-                    module_file.entry(py_name.clone()).or_insert_with(|| file.to_string());
+                    module_file
+                        .entry(py_name.clone())
+                        .or_insert_with(|| file.to_string());
                 }
                 exports.push(PyExport {
                     py_name,
@@ -250,9 +254,19 @@ fn lamquant_lml(m: &PyModule) -> PyResult<()> { Ok(()) }
 
         let g = scan(&base);
         // exports: encode (fn), decode_fast (renamed fn), lamquant_lml (module)
-        assert!(g.exports.iter().any(|e| e.py_name == "encode" && e.kind == ExportKind::Function));
-        assert!(g.exports.iter().any(|e| e.py_name == "decode_fast"), "{:?}", g.exports);
-        assert!(g.exports.iter().any(|e| e.py_name == "lamquant_lml" && e.kind == ExportKind::Module));
+        assert!(g
+            .exports
+            .iter()
+            .any(|e| e.py_name == "encode" && e.kind == ExportKind::Function));
+        assert!(
+            g.exports.iter().any(|e| e.py_name == "decode_fast"),
+            "{:?}",
+            g.exports
+        );
+        assert!(g
+            .exports
+            .iter()
+            .any(|e| e.py_name == "lamquant_lml" && e.kind == ExportKind::Module));
         // edge: train.py ↔ lamquant_lml, pulling encode + decode_fast
         let edge = g.edges.iter().find(|e| e.module == "lamquant_lml");
         assert!(edge.is_some(), "no FFI edge: {:?}", g.edges);

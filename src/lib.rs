@@ -17,13 +17,15 @@ pub mod ffi;
 pub mod lean;
 pub mod model;
 pub mod moves;
+pub mod scan;
 pub mod scip;
 pub mod tree;
 pub mod walk;
 
 pub use config::{Config, NodeSpec};
 pub use lean::{analyze, LeanBaseline, LeanReport};
-pub use scip::CodeGraph;
 pub use model::{Kind, Node, NodeId, Plane};
 pub use moves::{Move, MovePlan, ReferenceResolver, RustModuleResolver, Workspace};
+pub use scan::{Scan, ScanConfig};
+pub use scip::CodeGraph;
 pub use tree::Tree;

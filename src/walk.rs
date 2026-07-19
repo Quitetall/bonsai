@@ -8,8 +8,15 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Skip these regardless of `.gitignore` (VCS/build/cache trees that may be tracked).
-pub const DEFAULT_SKIP: &[&str] =
-    &["target", ".git", "node_modules", "__pycache__", ".venv", "_dist", "graphify-out"];
+pub const DEFAULT_SKIP: &[&str] = &[
+    "target",
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "_dist",
+    "graphify-out",
+];
 
 /// One walked entry, path relative to the walk root.
 pub struct Entry {
@@ -36,7 +43,12 @@ pub fn walk(root: &Path, extra_skip: &[String]) -> Vec<Entry> {
         .require_git(false)
         .parents(true)
         .sort_by_file_name(Ord::cmp);
-    wb.filter_entry(move |e| e.file_name().to_str().map(|n| !skip.contains(n)).unwrap_or(true));
+    wb.filter_entry(move |e| {
+        e.file_name()
+            .to_str()
+            .map(|n| !skip.contains(n))
+            .unwrap_or(true)
+    });
 
     let mut out = Vec::new();
     for res in wb.build() {
@@ -44,9 +56,14 @@ pub fn walk(root: &Path, extra_skip: &[String]) -> Vec<Entry> {
         if entry.depth() == 0 {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        out.push(Entry { rel: rel.to_path_buf(), is_dir });
+        out.push(Entry {
+            rel: rel.to_path_buf(),
+            is_dir,
+        });
     }
     out
 }
@@ -86,24 +103,6 @@ pub fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn subrepo_of_picks_deepest() {
-        let roots = vec![
-            PathBuf::from("sub"),
-            PathBuf::from("sub/nested"),
-            PathBuf::from("other"),
-        ];
-        assert_eq!(subrepo_of(Path::new("sub/nested/a.rs"), &roots), Path::new("sub/nested"));
-        assert_eq!(subrepo_of(Path::new("sub/a.rs"), &roots), Path::new("sub"));
-        assert_eq!(subrepo_of(Path::new("top.rs"), &roots), Path::new("")); // top repo
-        assert_eq!(subrepo_of(Path::new("other/x.rs"), &roots), Path::new("other"));
-    }
-}
-
 /// Files only, filtered to the given extensions (lowercase, no dot). Empty `exts` = all files.
 pub fn files_with_ext(root: &Path, extra_skip: &[String], exts: &[&str]) -> Vec<PathBuf> {
     walk(root, extra_skip)
@@ -118,4 +117,28 @@ pub fn files_with_ext(root: &Path, extra_skip: &[String], exts: &[&str]) -> Vec<
                     .unwrap_or(false)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subrepo_of_picks_deepest() {
+        let roots = vec![
+            PathBuf::from("sub"),
+            PathBuf::from("sub/nested"),
+            PathBuf::from("other"),
+        ];
+        assert_eq!(
+            subrepo_of(Path::new("sub/nested/a.rs"), &roots),
+            Path::new("sub/nested")
+        );
+        assert_eq!(subrepo_of(Path::new("sub/a.rs"), &roots), Path::new("sub"));
+        assert_eq!(subrepo_of(Path::new("top.rs"), &roots), Path::new("")); // top repo
+        assert_eq!(
+            subrepo_of(Path::new("other/x.rs"), &roots),
+            Path::new("other")
+        );
+    }
 }

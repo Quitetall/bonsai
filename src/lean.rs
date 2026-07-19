@@ -10,11 +10,10 @@
 //! score so leanness can only improve (sequester-never-delete, monotone toward 0 waste).
 
 use crate::model::Kind;
+use crate::scan::{Scan, ScanConfig};
 use crate::tree::Tree;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{Hash, Hasher};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// A set of files with byte-identical content (an exact clone group).
@@ -89,8 +88,17 @@ fn ratio(num: usize, den: usize) -> f64 {
     }
 }
 
-/// Compute the leanness report over the loaded tree, reading anchored file contents.
+/// Compute the leanness report over the loaded tree. Runs one parallel content scan and
+/// reads every file exactly once (see [`crate::scan`]); the old three-serial-reads path is gone.
 pub fn analyze(tree: &Tree, root: &Path) -> LeanReport {
+    analyze_from_scan(tree, &Scan::run(root, &ScanConfig::gate()))
+}
+
+/// Compute the leanness report from an already-run [`Scan`] — the shared entry point so a
+/// caller wanting both the report and near-duplicates (e.g. `bonsai lean`) pays for the scan
+/// once. Structure (empty dirs, depth, counts) comes from the `tree`; content waste (exact
+/// duplicates, cross-repo mirrors) comes from the scan's strong hashes.
+pub fn analyze_from_scan(tree: &Tree, scan: &Scan) -> LeanReport {
     let mut report = LeanReport {
         deferred: vec![
             "dead-code (reachability — needs SCIP)",
@@ -118,36 +126,31 @@ pub fn analyze(tree: &Tree, root: &Path) -> LeanReport {
     report.empty_dirs.sort();
     report.max_depth = depth_of(tree);
 
-    // exact-duplicate content groups (skip empty files — trivially identical, pure noise).
-    // Group by content hash; a group that spans multiple sub-repos is a cross-repo *mirror*
-    // (informational), while duplicates *within one sub-repo* are the real waste.
-    let subrepos = crate::walk::subrepo_roots(root, &[]);
-    let mut by_hash: BTreeMap<u64, Vec<(String, usize, String)>> = BTreeMap::new();
-    for node in tree.nodes.values() {
-        if node.kind != Kind::Atom {
-            continue;
-        }
-        let Some(anchor) = node.anchors.first() else {
-            continue;
-        };
-        let p = root.join(anchor);
-        if std::fs::metadata(&p).map(|m| m.len() > 2_000_000).unwrap_or(true) {
-            continue; // skip huge/unreadable (blobs aren't source dup candidates)
-        }
-        let Ok(bytes) = std::fs::read(&p) else {
-            continue;
-        };
-        if bytes.is_empty() {
-            continue;
-        }
-        let mut h = DefaultHasher::new();
-        bytes.hash(&mut h);
-        let loc = bytes.iter().filter(|b| **b == b'\n').count() + 1;
-        let sub = crate::walk::subrepo_of(std::path::Path::new(anchor), &subrepos)
-            .to_string_lossy()
-            .to_string();
-        by_hash.entry(h.finish()).or_default().push((node.id.clone(), loc, sub));
+    let (groups, mirrors) = exact_dups(scan);
+    report.dup_groups = groups;
+    report.cross_repo_mirrors = mirrors;
+    report
+}
+
+/// Exact-duplicate content groups from a scan's strong (blake3) hashes, returning
+/// `(within-sub-repo dup groups, count of cross-sub-repo mirrors)`. A group that spans more
+/// than one sub-repo is a legitimate mirror (a per-submodule LICENSE), not counted as waste;
+/// duplicates *within* one sub-repo are the real thing. Empty/binary-cap/unreadable files
+/// carry no hash and never group. blake3's 256-bit width makes a false collision infeasible,
+/// so equal hashes are taken as equal content without a byte re-verify.
+pub fn exact_dups(scan: &Scan) -> (Vec<DupGroup>, usize) {
+    // hash → [(rel-id, loc, sub-repo)]
+    let mut by_hash: BTreeMap<[u8; 32], Vec<(String, usize, String)>> = BTreeMap::new();
+    for f in &scan.files {
+        let Some(h) = f.hash else { continue };
+        by_hash
+            .entry(h)
+            .or_default()
+            .push((f.rel_str(), f.lines as usize, f.subrepo_str()));
     }
+
+    let mut groups = Vec::new();
+    let mut mirrors = 0usize;
     for (_, group) in by_hash {
         // partition the identical-content group by sub-repo
         let mut by_sub: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
@@ -155,23 +158,21 @@ pub fn analyze(tree: &Tree, root: &Path) -> LeanReport {
             by_sub.entry(sub).or_default().push((id, loc));
         }
         if by_sub.len() > 1 {
-            report.cross_repo_mirrors += 1; // legitimate copy across repos — not counted
+            mirrors += 1; // legitimate copy across repos — not counted
         }
-        for (_sub, mut group) in by_sub {
-            if group.len() > 1 {
-                group.sort();
-                let loc = group[0].1;
-                report.dup_groups.push(DupGroup {
-                    files: group.into_iter().map(|(id, _)| id).collect(),
+        for (_sub, mut g) in by_sub {
+            if g.len() > 1 {
+                g.sort();
+                let loc = g[0].1;
+                groups.push(DupGroup {
+                    files: g.into_iter().map(|(id, _)| id).collect(),
                     loc,
                 });
             }
         }
     }
-    report
-        .dup_groups
-        .sort_by_key(|g| std::cmp::Reverse(g.files.len()));
-    report
+    groups.sort_by_key(|g| std::cmp::Reverse(g.files.len()));
+    (groups, mirrors)
 }
 
 /// The deepest containment path length (structure shape).
@@ -270,56 +271,39 @@ fn load_graph(root: &Path) -> Option<crate::scip::CodeGraph> {
     crate::scip::CodeGraph::from_file(&scip).ok()
 }
 
-/// Near-duplicate file pairs (similar but not byte-identical) via normalized-line shingling
-/// with a shared-line inverted index (so it stays near-linear instead of O(n²)). A pair is
-/// a near-dup when its line-set Jaccard is ≥ `threshold` and below 1.0 (exact dups are
-/// reported separately). Boilerplate lines shared by many files are dropped as stop-shingles.
-pub fn near_duplicates(tree: &Tree, root: &Path, threshold: f64) -> Vec<NearDup> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// Near-duplicate file pairs (similar but not byte-identical). Convenience wrapper that runs
+/// a shingle-computing scan; prefer [`near_duplicates_from_scan`] when a scan already exists.
+pub fn near_duplicates(_tree: &Tree, root: &Path, threshold: f64) -> Vec<NearDup> {
+    near_duplicates_from_scan(&Scan::run(root, &ScanConfig::with_shingles()), threshold)
+}
+
+/// Near-duplicate file pairs from a scan's shingle sets, via a shared-line inverted index
+/// (so it stays near-linear instead of O(n²)). A pair is a near-dup when its line-set Jaccard
+/// is ≥ `threshold` and below 1.0 (exact dups are reported separately). Boilerplate lines
+/// shared by many files are dropped as stop-shingles; cross-sub-repo pairs are excluded (a
+/// spec mirrored into a submodule is not cruft). Requires a scan run with `want_shingles`.
+pub fn near_duplicates_from_scan(scan: &Scan, threshold: f64) -> Vec<NearDup> {
     const MIN_LINES: usize = 8; // ignore tiny files (too little signal)
     const MAX_DF: usize = 40; // a line in >40 files is boilerplate → skip
     const MIN_SHARED: usize = 5; // candidate pairs must share ≥5 non-trivial lines
 
-    // per-file normalized line-hash set + its sub-repo (so cross-repo pairs are excluded —
-    // a spec mirrored into a submodule is not a near-dup to smash)
-    let subrepos = crate::walk::subrepo_roots(root, &[]);
+    // collect the shingled files (already normalized + deduped by the scan)
     let mut paths: Vec<String> = Vec::new();
-    let mut sets: Vec<BTreeSet<u64>> = Vec::new();
+    let mut sets: Vec<&[u64]> = Vec::new();
     let mut file_sub: Vec<String> = Vec::new();
-    for node in tree.nodes.values() {
-        if node.kind != Kind::Atom {
+    for f in &scan.files {
+        if f.shingles.len() < MIN_LINES {
             continue;
         }
-        let Some(anchor) = node.anchors.first() else { continue };
-        let Some(text) = crate::walk::read_text_capped(&root.join(anchor), 2_000_000) else {
-            continue;
-        };
-        let mut set = BTreeSet::new();
-        for line in text.lines() {
-            let t = line.trim();
-            if t.len() < 4 || t == "}" || t == "{" || t == ")" {
-                continue; // structural noise
-            }
-            let mut h = DefaultHasher::new();
-            t.hash(&mut h);
-            set.insert(h.finish());
-        }
-        if set.len() >= MIN_LINES {
-            paths.push(anchor.clone());
-            sets.push(set);
-            file_sub.push(
-                crate::walk::subrepo_of(std::path::Path::new(anchor), &subrepos)
-                    .to_string_lossy()
-                    .to_string(),
-            );
-        }
+        paths.push(f.rel_str());
+        sets.push(&f.shingles);
+        file_sub.push(f.subrepo_str());
     }
 
     // inverted index: line-hash → files containing it (dropping stop-shingles)
     let mut inv: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     for (i, set) in sets.iter().enumerate() {
-        for &h in set {
+        for &h in set.iter() {
             inv.entry(h).or_default().push(i);
         }
     }
@@ -344,16 +328,35 @@ pub fn near_duplicates(tree: &Tree, root: &Path, threshold: f64) -> Vec<NearDup>
         if file_sub[i] != file_sub[j] {
             continue; // cross-sub-repo copies are legitimate, not near-dup cruft
         }
-        let (si, sj) = (&sets[i], &sets[j]);
-        let inter = si.intersection(sj).count();
-        let union = si.len() + sj.len() - inter;
-        let jac = inter as f64 / union.max(1) as f64;
+        let jac = jaccard_sorted(sets[i], sets[j]);
         if jac >= threshold && jac < 1.0 {
-            out.push(NearDup { a: paths[i].clone(), b: paths[j].clone(), similarity: jac });
+            out.push(NearDup {
+                a: paths[i].clone(),
+                b: paths[j].clone(),
+                similarity: jac,
+            });
         }
     }
     out.sort_by(|x, y| y.similarity.partial_cmp(&x.similarity).unwrap());
     out
+}
+
+/// Jaccard similarity of two sorted, de-duplicated `u64` shingle slices (linear merge).
+fn jaccard_sorted(a: &[u64], b: &[u64]) -> f64 {
+    let (mut i, mut j, mut inter) = (0usize, 0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                inter += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    let union = a.len() + b.len() - inter;
+    inter as f64 / union.max(1) as f64
 }
 
 #[cfg(test)]
@@ -398,7 +401,9 @@ mod tests {
     #[test]
     fn near_dup_detects_similar_not_identical() {
         let base = probe_dir("neardup");
-        let body: String = (0..20).map(|i| format!("let v{i} = compute({i});\n")).collect();
+        let body: String = (0..20)
+            .map(|i| format!("let v{i} = compute({i});\n"))
+            .collect();
         // two files differing only in the last line → high Jaccard, not identical
         fs::write(base.join("a/x.rs"), format!("{body}return v0;\n")).unwrap();
         fs::write(base.join("b/y.rs"), format!("{body}return v19;\n")).unwrap();

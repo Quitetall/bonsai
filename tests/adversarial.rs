@@ -51,10 +51,19 @@ const LICENSE: &str = "AGPL-3.0-or-later\n\nCopyright the authors.\nAll rights r
 fn cross_subrepo_license_is_not_duplication() {
     let t = Tree::new("license");
     t.subrepo("modA").subrepo("modB");
-    t.file("modA/LICENSE", LICENSE).file("modB/LICENSE", LICENSE);
+    t.file("modA/LICENSE", LICENSE)
+        .file("modB/LICENSE", LICENSE);
     let (r, _) = t.analyze();
-    assert_eq!(r.dup_files(), 0, "cross-repo LICENSE wrongly flagged: {:?}", r.dup_groups);
-    assert!(r.cross_repo_mirrors >= 1, "should record the mirror informationally");
+    assert_eq!(
+        r.dup_files(),
+        0,
+        "cross-repo LICENSE wrongly flagged: {:?}",
+        r.dup_groups
+    );
+    assert!(
+        r.cross_repo_mirrors >= 1,
+        "should record the mirror informationally"
+    );
 }
 
 /// TRAP 2 — the SAME file duplicated *within one repo* is real cruft and MUST be flagged.
@@ -65,7 +74,12 @@ fn within_repo_duplicate_is_flagged() {
     t.file("a/dup.py", "def f():\n    return 42\n\nx = f()\n");
     t.file("b/dup.py", "def f():\n    return 42\n\nx = f()\n");
     let (r, _) = t.analyze();
-    assert_eq!(r.dup_files(), 1, "within-repo dup missed: {:?}", r.dup_groups);
+    assert_eq!(
+        r.dup_files(),
+        1,
+        "within-repo dup missed: {:?}",
+        r.dup_groups
+    );
     assert_eq!(r.cross_repo_mirrors, 0);
 }
 
@@ -102,7 +116,12 @@ fn nested_subrepo_boundary_is_innermost() {
     t.file("outer/shared.txt", "alpha beta gamma delta epsilon\n")
         .file("outer/inner/shared.txt", "alpha beta gamma delta epsilon\n");
     let (r, _) = t.analyze();
-    assert_eq!(r.dup_files(), 0, "nested-repo copy wrongly flagged: {:?}", r.dup_groups);
+    assert_eq!(
+        r.dup_files(),
+        0,
+        "nested-repo copy wrongly flagged: {:?}",
+        r.dup_groups
+    );
     assert!(r.cross_repo_mirrors >= 1);
 }
 
@@ -110,9 +129,16 @@ fn nested_subrepo_boundary_is_innermost() {
 #[test]
 fn empty_files_are_not_duplicates() {
     let t = Tree::new("empties");
-    t.file("a/__init__.py", "").file("b/__init__.py", "").file("c/__init__.py", "");
+    t.file("a/__init__.py", "")
+        .file("b/__init__.py", "")
+        .file("c/__init__.py", "");
     let (r, _) = t.analyze();
-    assert_eq!(r.dup_files(), 0, "empty files wrongly grouped: {:?}", r.dup_groups);
+    assert_eq!(
+        r.dup_files(),
+        0,
+        "empty files wrongly grouped: {:?}",
+        r.dup_groups
+    );
 }
 
 /// TRAP 7 — a `.gitignore`d artifact must be invisible to the scan (no phantom cruft, no
@@ -145,7 +171,12 @@ fn top_repo_dup_counts_alongside_subrepos() {
     t.file("tools/x.sh", "#!/bin/sh\necho hello world\n");
     t.file("scripts/x.sh", "#!/bin/sh\necho hello world\n"); // top-repo dup
     let (r, _) = t.analyze();
-    assert_eq!(r.dup_files(), 1, "top-repo dup miscounted: {:?}", r.dup_groups);
+    assert_eq!(
+        r.dup_files(),
+        1,
+        "top-repo dup miscounted: {:?}",
+        r.dup_groups
+    );
 }
 
 /// Sub-repo detection itself: a `.git` file marks a boundary; plain dirs do not.
@@ -154,6 +185,12 @@ fn subrepo_roots_detects_git_boundaries() {
     let t = Tree::new("roots");
     t.subrepo("a").file("a/f.rs", "x").file("plain/f.rs", "y");
     let roots = bonsai::walk::subrepo_roots(&t.0, &[]);
-    assert!(roots.iter().any(|p| p == Path::new("a")), "missed sub-repo: {roots:?}");
-    assert!(!roots.iter().any(|p| p == Path::new("plain")), "plain dir flagged as sub-repo");
+    assert!(
+        roots.iter().any(|p| p == Path::new("a")),
+        "missed sub-repo: {roots:?}"
+    );
+    assert!(
+        !roots.iter().any(|p| p == Path::new("plain")),
+        "plain dir flagged as sub-repo"
+    );
 }

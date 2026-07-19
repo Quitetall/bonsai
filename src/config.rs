@@ -104,7 +104,10 @@ fn default_version() -> u32 {
     1
 }
 fn default_skip() -> Vec<String> {
-    crate::walk::DEFAULT_SKIP.iter().map(|s| s.to_string()).collect()
+    crate::walk::DEFAULT_SKIP
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 impl NodeSpec {
@@ -143,7 +146,10 @@ impl Config {
 
     /// Like [`from_dir`](Self::from_dir) but adds `extra_skip` directory names to the default
     /// skip set (e.g. vendored/sequestered/scratch trees when adopting on a real repo).
-    pub fn from_dir_with_skip(root: impl AsRef<Path>, extra_skip: &[String]) -> anyhow::Result<Self> {
+    pub fn from_dir_with_skip(
+        root: impl AsRef<Path>,
+        extra_skip: &[String],
+    ) -> anyhow::Result<Self> {
         let mut meta = Meta::default();
         for s in extra_skip {
             if !meta.skip.contains(s) {
@@ -288,7 +294,6 @@ fn wire_children(nodes: &mut BTreeMap<NodeId, Node>) {
         n.children.sort();
     }
 }
-
 
 /// A repo-relative path → node id (forward-slashed, extension kept — paths are natural ids).
 fn rel_id(rel: &Path) -> String {

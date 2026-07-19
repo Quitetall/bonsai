@@ -130,7 +130,11 @@ fn main() -> Result<()> {
         Cmd::Lean { root, save } => cmd_lean(&root, save),
         Cmd::Check { root } => cmd_check(&root),
         Cmd::Docs { root } => cmd_docs(&root),
-        Cmd::Index { root, scip, generate } => cmd_index(&root, scip.as_deref(), generate),
+        Cmd::Index {
+            root,
+            scip,
+            generate,
+        } => cmd_index(&root, scip.as_deref(), generate),
         Cmd::Ffi { root } => cmd_ffi(&root),
         Cmd::Tidy { root, write } => cmd_tidy(&root, write),
     }
@@ -143,7 +147,10 @@ fn main() -> Result<()> {
 fn cmd_tidy(root: &Path, write: bool) -> Result<()> {
     let scip = root.join("index.scip");
     if !scip.exists() {
-        anyhow::bail!("no {} — run `bonsai index --generate` first", scip.display());
+        anyhow::bail!(
+            "no {} — run `bonsai index --generate` first",
+            scip.display()
+        );
     }
     let g = bonsai::scip::CodeGraph::from_file(&scip)
         .with_context(|| format!("parsing {}", scip.display()))?;
@@ -167,7 +174,10 @@ fn cmd_tidy(root: &Path, write: bool) -> Result<()> {
         };
         // recompute against fresh disk state so sequential applies stay correct
         let ws = Workspace::from_dir(root)?;
-        let mv = Move { from: PathBuf::from(&m.file), to: PathBuf::from(&to) };
+        let mv = Move {
+            from: PathBuf::from(&m.file),
+            to: PathBuf::from(&to),
+        };
         if !ws.files.contains_key(&mv.from) {
             continue; // already moved by an earlier proposal
         }
@@ -285,7 +295,11 @@ fn cmd_index(root: &Path, scip: Option<&Path>, generate: bool) -> Result<()> {
     ranked.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
     println!("  top fan-in symbols:");
     for (sym, n) in ranked.into_iter().take(8) {
-        let name = g.symbols.get(sym).map(|s| s.display.as_str()).filter(|s| !s.is_empty());
+        let name = g
+            .symbols
+            .get(sym)
+            .map(|s| s.display.as_str())
+            .filter(|s| !s.is_empty());
         println!("    {n:>3}×  {}", name.unwrap_or(sym));
     }
 
@@ -293,8 +307,17 @@ fn cmd_index(root: &Path, scip: Option<&Path>, generate: bool) -> Result<()> {
     let dead = g.dead_symbols(root, &[]);
     println!("  dead (unreachable from pub API + main): {}", dead.len());
     for s in dead.iter().take(20) {
-        let name = if s.display.is_empty() { "?" } else { &s.display };
-        println!("    kind {:>2}  {}:{}  {name}", s.kind, s.file, s.def.sl + 1);
+        let name = if s.display.is_empty() {
+            "?"
+        } else {
+            &s.display
+        };
+        println!(
+            "    kind {:>2}  {}:{}  {name}",
+            s.kind,
+            s.file,
+            s.def.sl + 1
+        );
     }
     Ok(())
 }
@@ -327,7 +350,9 @@ const LEAN_BASELINE: &str = "bonsai.lean.json";
 fn cmd_lean(root: &Path, save: bool) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
-    let mut r = bonsai::lean::analyze(&tree, root);
+    // one parallel content pass feeds both the exact-dup report and near-duplicates
+    let scan = bonsai::scan::Scan::run(root, &bonsai::scan::ScanConfig::with_shingles());
+    let mut r = bonsai::lean::analyze_from_scan(&tree, &scan);
     // measure SCIP-backed signals if an index is present (moves them out of "deferred")
     r.dead_code = bonsai::lean::dead_code_count(root);
     r.misplaced = bonsai::lean::misplacement_count(root);
@@ -358,14 +383,17 @@ fn cmd_lean(root: &Path, save: bool) -> Result<()> {
         r.dup_groups.len(),
         r.wasted_loc()
     );
-    let near = bonsai::lean::near_duplicates(&tree, root, 0.85);
+    let near = bonsai::lean::near_duplicates_from_scan(&scan, 0.85);
     if r.cross_repo_mirrors > 0 {
         println!(
             "  cross-repo mirrors: {} (identical across sub-repos — NOT counted as waste)",
             r.cross_repo_mirrors
         );
     }
-    println!("  near-duplicates: {} pair(s) (≥0.85 similar, not identical)", near.len());
+    println!(
+        "  near-duplicates: {} pair(s) (≥0.85 similar, not identical)",
+        near.len()
+    );
     for nd in near.iter().take(8) {
         println!("    {:.0}%  {}  ~  {}", nd.similarity * 100.0, nd.a, nd.b);
     }
