@@ -1,0 +1,37 @@
+[bonsai]
+root = "."
+version = 1
+skip = [
+    "target",
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "_dist",
+    "graphify-out",
+]
+
+[docs]
+compose = "python3 docs/compose.py"
+
+[[node]]
+id = "docs"
+kind = "composite"
+plane = "docs"
+parent = "."
+anchors = ["docs"]
+
+[node.facets]
+language = "python"
+plane = "docs"
+
+[[node]]
+id = "src"
+kind = "composite"
+plane = "code"
+parent = "."
+anchors = ["src"]
+
+[node.facets]
+language = "rust"
+plane = "code"

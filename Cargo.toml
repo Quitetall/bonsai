@@ -1,0 +1,28 @@
+# Bonsai — one recursive atom/parent engine for code structure AND documentation (ADR 0134).
+# Standalone workspace (own `[workspace]`) so it is isolated from the meta-repo root
+# workspace and extraction-ready (Bonsai graduates to its own repo).
+[package]
+name = "bonsai"
+version = "0.0.0"
+edition = "2021"
+description = "One recursive atom/parent engine for code structure and documentation (ADR 0134)"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "bonsai"
+path = "src/main.rs"
+
+[lib]
+name = "bonsai"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+walkdir = "2"
+
+# Isolate from any parent cargo workspace.
+[workspace]
