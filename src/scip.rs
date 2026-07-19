@@ -71,6 +71,7 @@ pub struct CodeGraph {
 }
 
 const ROLE_DEFINITION: i32 = 1; // SymbolRole::Definition (bit 0)
+const KIND_MODULE: i32 = 29; // SymbolInformation.Kind::Module
 
 impl CodeGraph {
     /// Parse a `.scip` protobuf index from disk.
@@ -137,7 +138,10 @@ impl CodeGraph {
                         }
                     }
                 }
-                if *file != target_file {
+                // Module targets are `mod X;`/`use path::to::module` *containment/import*
+                // edges, not coupling — excluding them keeps the dependency DAG (and the
+                // misplacement fold that reads its reverse edges) about real usage.
+                if *file != target_file && target.kind != KIND_MODULE {
                     g.file_deps.entry(file.clone()).or_default().insert(target_file);
                 }
             }
@@ -349,6 +353,31 @@ mod tests {
         let entry: BTreeSet<String> = ["bar#".to_string()].into_iter().collect();
         let reach = g.reachable(&entry);
         assert!(reach.contains("foo#") && reach.contains("bar#"));
+    }
+
+    #[test]
+    fn module_containment_edges_excluded_from_coupling() {
+        // b.rs only does `mod m;` (a reference to a Module-kind symbol defined in a.rs).
+        // That is containment, not coupling → no file-dep edge, so a.rs is not "misplaced".
+        let mut a = Document::new();
+        a.relative_path = "a.rs".into();
+        a.occurrences.push(occ("m#", vec![0, 4, 0, 5], true, vec![0, 0, 3, 0]));
+        let mut minfo = scip::types::SymbolInformation::new();
+        minfo.symbol = "m#".into();
+        minfo.kind = scip::types::symbol_information::Kind::Module.into();
+        a.symbols.push(minfo);
+
+        let mut b = Document::new();
+        b.relative_path = "b.rs".into();
+        b.occurrences.push(occ("root#", vec![0, 0, 0, 4], true, vec![0, 0, 5, 0]));
+        b.occurrences.push(occ("m#", vec![1, 4, 1, 5], false, vec![])); // `mod m;`
+
+        let mut idx = Index::new();
+        idx.documents.push(a);
+        idx.documents.push(b);
+        let g = CodeGraph::from_index(&idx);
+        assert!(g.file_deps.is_empty(), "module edge leaked into coupling: {:?}", g.file_deps);
+        assert!(g.misplacements().is_empty());
     }
 
     #[test]

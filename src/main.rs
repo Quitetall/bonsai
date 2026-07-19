@@ -91,6 +91,14 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
+    /// Propose (or apply) structural refactors from the leanness signals — misplaced files
+    /// become reference-safe moves. Dry-run unless `--write`. Needs a SCIP index.
+    Tidy {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        write: bool,
+    },
     /// Parse a SCIP index into the code graph (symbols, ref edges, file DAG) + print stats.
     Index {
         #[arg(long, default_value = ".")]
@@ -121,7 +129,66 @@ fn main() -> Result<()> {
         Cmd::Docs { root } => cmd_docs(&root),
         Cmd::Index { root, scip, generate } => cmd_index(&root, scip.as_deref(), generate),
         Cmd::Ffi { root } => cmd_ffi(&root),
+        Cmd::Tidy { root, write } => cmd_tidy(&root, write),
     }
+}
+
+/// The telos capstone: turn leanness signals into ready-to-apply refactors. Today it drives
+/// the **misplacement** fold → a **reference-safe move** (the novel engine) for each file
+/// used only from one other directory. Propose-by-default; `--write` executes (the structural
+/// half of refactoring, done for you). Sequester-of-dead-code is the next tidy action.
+fn cmd_tidy(root: &Path, write: bool) -> Result<()> {
+    let scip = root.join("index.scip");
+    if !scip.exists() {
+        anyhow::bail!("no {} — run `bonsai index --generate` first", scip.display());
+    }
+    let g = bonsai::scip::CodeGraph::from_file(&scip)
+        .with_context(|| format!("parsing {}", scip.display()))?;
+    let mis = g.misplacements();
+    if mis.is_empty() {
+        println!("bonsai tidy: nothing to tidy — no misplaced files.");
+        return Ok(());
+    }
+
+    println!(
+        "bonsai tidy: {} misplacement(s) → reference-safe move proposal(s)\n",
+        mis.len()
+    );
+    let mut applied = 0;
+    for m in &mis {
+        let base = m.file.rsplit_once('/').map(|(_, b)| b).unwrap_or(&m.file);
+        let to = if m.suggested_dir.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}/{}", m.suggested_dir, base)
+        };
+        // recompute against fresh disk state so sequential applies stay correct
+        let ws = Workspace::from_dir(root)?;
+        let mv = Move { from: PathBuf::from(&m.file), to: PathBuf::from(&to) };
+        if !ws.files.contains_key(&mv.from) {
+            continue; // already moved by an earlier proposal
+        }
+        let plan = plan_move(&ws, &mv);
+        println!(
+            "▸ {} used only from {}/ ({} dependents)",
+            m.file, m.suggested_dir, m.dependents
+        );
+        print!("{}", plan.render_diff());
+        if write && plan.warnings.is_empty() {
+            apply_plan(root, &plan)?;
+            applied += 1;
+            println!("  → applied");
+        } else if write {
+            println!("  → skipped (has warnings — review by hand)");
+        }
+        println!();
+    }
+    if write {
+        println!("applied {applied}/{} proposal(s).", mis.len());
+    } else {
+        println!("(dry-run — pass `--write` to apply the warning-free proposals)");
+    }
+    Ok(())
 }
 
 /// Stitch and report the Python↔Rust FFI boundary — the permanent cross-language edges SCIP
