@@ -23,9 +23,47 @@ pub struct Config {
     /// Conformance rules (optional) — the admission gate for new code (ADR 0134).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Rules>,
+    /// Per-level contracts (optional) — the architecture gate: what an addition at a level MUST
+    /// do (fulfill the anchor), MUST NOT do (forbidden reach), and what seams are frozen.
+    #[serde(default, rename = "contract", skip_serializing_if = "Vec::is_empty")]
+    pub contracts: Vec<Contract>,
     /// Authored nodes. Serialized as `[[node]]` tables.
     #[serde(default, rename = "node")]
     pub nodes: Vec<NodeSpec>,
+}
+
+/// A `[[contract]]` — the architecture gate for one *level*. It makes Bonsai *force additions to
+/// a level to do what that level needs, and no more*: a new module that triggers the level's kind
+/// must fulfill its anchor trait ("grow through anchor traits"), may not reach for a forbidden
+/// escape hatch, and cannot replace a sealed seam (you extend the abstraction with a new impl a
+/// layer down — you don't swap it out). Enforced fail-closed by `check`, so it runs on every
+/// commit through the installed hook — friction-free, like a test that forces level compliance.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Contract {
+    /// Repo-relative path prefix this contract governs (the level's home, e.g. a crate's `src`).
+    pub path: String,
+    /// Human-readable level name, surfaced in violation messages.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub level: String,
+    /// The **trigger**: a source substring that marks a file as a new addition of this level's
+    /// kind (e.g. a wire-format magic, or a marker attribute). A file under `path` containing it
+    /// must satisfy `must_impl`. Absent = the contract applies to every file under `path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_defines: Option<String>,
+    /// The **anchor**: the trait a triggered file must implement (an `impl <must_impl> for …`
+    /// must appear in it). This is "no wire format without `impl Codec`" — an addition earns its
+    /// place only by fulfilling the level's contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub must_impl: Option<String>,
+    /// Source substrings **forbidden** anywhere under `path` — the "and no more" rail (a
+    /// lower-level escape hatch a higher level must never reach for). Each hit is a violation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbid: Vec<String>,
+    /// A **sealed** abstraction: this trait/type definition must persist somewhere in the repo.
+    /// Additions extend it with new impls; they may not delete or rename the seam — you can add
+    /// a codec that fulfills `Codec`, you cannot replace `Codec` itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<String>,
 }
 
 /// The `[rules]` block — declarative conformance the `check` gate enforces fail-closed, so new
@@ -219,6 +257,7 @@ impl Config {
             bonsai: meta,
             docs: None,
             rules: None,
+            contracts: Vec::new(),
             nodes,
         })
     }

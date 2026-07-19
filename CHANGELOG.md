@@ -3,6 +3,21 @@
 All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versions are
 [SemVer](https://semver.org). Dates are ISO-8601.
 
+## [Unreleased]
+
+### Added — governed growth
+- **Placement oracle** (`bonsai place <file>`): ranks the directories a file couples to and names
+  its home — exact SCIP coupling for an indexed file, `crate::`-import scan for a new one; prints
+  the reference-safe move when it's misplaced.
+- **Conformance rules** (`[rules]`): `layers` (downward-only dependency direction), `max_files_per_dir`
+  (bounded growth), `enforce_placement` (a misplaced file fails the gate). Opt-in per repo.
+- **Architecture contracts** (`[[contract]]`): per-level fitness functions — *grow-through-anchor-traits*
+  (`when_defines` → `must_impl`), *forbidden reach* (`forbid`), and *sealed seams* (`sealed`: an
+  abstraction that may be extended with new impls but never replaced). Enforced fail-closed by `check`.
+- **Automatic pre-commit gate** (`bonsai hook install`): writes a git hook that runs `bonsai check`
+  on every commit, so a non-conformant addition is blocked with zero friction. `status` / `uninstall`
+  included; resolves the hooks dir via `git rev-parse` (submodule/worktree-safe).
+
 ## [0.1.0] — 2026-07-19
 
 First tagged release: the proof-of-concept hardened into a tool that runs from a laptop repo to a

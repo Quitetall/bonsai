@@ -35,3 +35,8 @@ anchors = ["src"]
 [node.facets]
 language = "rust"
 plane = "code"
+
+[[contract]]
+path = "src"
+level = "move-engine"
+sealed = "ReferenceResolver"

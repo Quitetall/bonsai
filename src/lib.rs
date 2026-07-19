@@ -14,6 +14,7 @@
 
 pub mod cache;
 pub mod config;
+pub mod contracts;
 pub mod ffi;
 pub mod finding;
 pub mod lean;
@@ -26,7 +27,7 @@ pub mod scip;
 pub mod tree;
 pub mod walk;
 
-pub use config::{Config, NodeSpec, Rules};
+pub use config::{Config, Contract, NodeSpec, Rules};
 pub use finding::{Finding, Location, Report, Severity};
 pub use lean::{analyze, LeanBaseline, LeanReport};
 pub use model::{Kind, Node, NodeId, Plane};

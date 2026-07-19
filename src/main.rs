@@ -23,6 +23,17 @@ enum Format {
     Sarif,
 }
 
+/// What `bonsai hook` should do to the automatic pre-commit gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HookAction {
+    /// Write a git pre-commit hook that runs `bonsai check` (default).
+    Install,
+    /// Report whether the hook is installed.
+    Status,
+    /// Remove the bonsai-managed hook.
+    Uninstall,
+}
+
 #[derive(Parser)]
 #[command(
     name = "bonsai",
@@ -146,6 +157,14 @@ enum Cmd {
         #[arg(long)]
         generate: bool,
     },
+    /// Install the automatic pre-commit gate: after this, every commit runs `bonsai check`
+    /// (placement, layering, contracts, ratchet) with zero friction — devs never invoke it.
+    Hook {
+        #[arg(value_enum, default_value = "install")]
+        action: HookAction,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -180,7 +199,94 @@ fn main() -> Result<()> {
         Cmd::Ffi { root } => cmd_ffi(&root),
         Cmd::Tidy { root, write } => cmd_tidy(&root, write),
         Cmd::Place { file, root } => cmd_place(&root, &file),
+        Cmd::Hook { action, root } => cmd_hook(&root, action),
     }
+}
+
+const HOOK_MARK: &str = "# bonsai-managed pre-commit hook";
+
+/// Install / inspect / remove the automatic pre-commit gate — the friction-free enforcement
+/// layer. Once installed, `bonsai check` runs on every commit, so a non-conformant addition
+/// (misplaced, upward-coupled, contract-breaking, or leanness-regressing) is blocked before it
+/// lands, without any dev remembering to run a command.
+fn cmd_hook(root: &Path, action: HookAction) -> Result<()> {
+    let hook = git_hooks_dir(root)?.join("pre-commit");
+    let is_ours = |p: &Path| {
+        std::fs::read_to_string(p)
+            .map(|s| s.contains(HOOK_MARK))
+            .unwrap_or(false)
+    };
+    match action {
+        HookAction::Install => {
+            if hook.exists() && !is_ours(&hook) {
+                anyhow::bail!(
+                    "{} already exists and is not bonsai-managed — add `bonsai check` to it by \
+                     hand, or remove it first",
+                    hook.display()
+                );
+            }
+            let script = format!(
+                "#!/bin/sh\n{HOOK_MARK}\n# Blocks a commit that regresses structure, leanness, or a level contract.\nexec bonsai check --root \"$(git rev-parse --show-toplevel)\"\n"
+            );
+            std::fs::write(&hook, script).with_context(|| format!("writing {}", hook.display()))?;
+            set_executable(&hook)?;
+            println!("bonsai hook: installed → {}", hook.display());
+            println!("  every commit now runs `bonsai check` (placement · layering · contracts · ratchet).");
+        }
+        HookAction::Status => {
+            if hook.exists() && is_ours(&hook) {
+                println!("bonsai hook: INSTALLED at {}", hook.display());
+            } else if hook.exists() {
+                println!(
+                    "bonsai hook: a NON-bonsai pre-commit hook is present at {}",
+                    hook.display()
+                );
+            } else {
+                println!("bonsai hook: not installed — run `bonsai hook install`");
+            }
+        }
+        HookAction::Uninstall => {
+            if hook.exists() && is_ours(&hook) {
+                std::fs::remove_file(&hook)
+                    .with_context(|| format!("removing {}", hook.display()))?;
+                println!("bonsai hook: removed {}", hook.display());
+            } else {
+                println!("bonsai hook: nothing to remove (no bonsai-managed hook).");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the git hooks directory for `root` (handles submodules + worktrees, where `.git` is a
+/// file pointing elsewhere) via `git rev-parse --git-path hooks`.
+fn git_hooks_dir(root: &Path) -> Result<PathBuf> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .context("running `git rev-parse --git-path hooks` (is git installed?)")?;
+    if !out.status.success() {
+        anyhow::bail!("not a git repository at {}", root.display());
+    }
+    let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let dir = root.join(rel);
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir)
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).with_context(|| format!("chmod +x {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<()> {
+    Ok(()) // git on Windows treats the hook as executable by content
 }
 
 /// The telos capstone: turn leanness signals into ready-to-apply refactors. Today it drives
@@ -753,6 +859,14 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
     // 3. conformance rules — the admission gate (layering, bounded growth, placement)
     if let Some(rules) = &cfg.rules {
         findings.extend(bonsai::rules::evaluate(&tree, graph.as_ref(), rules));
+    }
+
+    // 4. architecture contracts — force each level to fulfill its anchor, forbid escape hatches,
+    //    and keep sealed seams frozen (reads the .rs sources once, only when contracts exist)
+    if !cfg.contracts.is_empty() {
+        let ws = Workspace::from_dir(root)
+            .with_context(|| format!("scanning sources at {}", root.display()))?;
+        findings.extend(bonsai::contracts::evaluate(&ws, &cfg.contracts));
     }
 
     let report = Report::new(findings);

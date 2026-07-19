@@ -62,9 +62,42 @@ bonsai apply a/x.rs b/x.rs --write   # …actually rewrite the references + move
 bonsai index --generate         # build a SCIP index (rust-analyzer) for dead-code/misplacement
 bonsai tidy                     # propose reference-safe moves from the misplacement signal
 bonsai ffi                      # stitch the Python↔Rust (PyO3) boundary SCIP can't see
+bonsai place src/foo.rs         # where does this belong? (coupling oracle; new or indexed file)
+bonsai hook install             # install the automatic pre-commit gate (runs check on commit)
 ```
 
 Every command takes `--root <dir>` (default `.`).
+
+## Governed growth — where new code goes, enforced
+
+The point isn't just to *report* structure — it's to hold the repo at its provable minimum as it
+grows. Bonsai does that with a placement oracle plus a fail-closed admission gate that runs
+automatically on every commit:
+
+- **`bonsai place <file>`** ranks the directories a file couples to and names its home (exact SCIP
+  coupling for an indexed file; a `crate::`-import scan for one you just wrote).
+- **`bonsai hook install`** writes a git pre-commit hook that runs `bonsai check` — so nobody has to
+  remember to run anything; a non-conformant addition is blocked before it lands.
+- **`bonsai check`** enforces, from `bonsai.toml`, three families of rule (all opt-in):
+
+```toml
+[rules]
+layers = ["kernel", "engine", "cli"]   # dependencies must run DOWNWARD (never couple upward)
+max_files_per_dir = 40                  # bound growth — no directory bloats into a dumping ground
+enforce_placement = true                # a misplaced file fails the gate, not just warns
+
+[[contract]]                            # the architecture gate for one level
+path  = "codec/src"
+level = "codec"
+when_defines = "WireMagic"              # a file that declares a wire format…
+must_impl    = "Codec"                  # …must implement the Codec anchor ("grow through anchors")
+sealed       = "Codec"                  # …and the Codec seam itself can't be replaced, only extended
+forbid = ["std::mem::transmute"]        # an escape hatch this level may never reach for
+```
+
+A programmer can add a new codec a layer down that fulfills `Codec`, but cannot replace the `Codec`
+abstraction or add a wire format that bypasses it — the gate forces each addition to do what its
+level needs, and no more, without friction.
 
 ## Scale
 
