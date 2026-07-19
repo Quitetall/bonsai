@@ -19,12 +19,14 @@ pub mod finding;
 pub mod lean;
 pub mod model;
 pub mod moves;
+pub mod place;
+pub mod rules;
 pub mod scan;
 pub mod scip;
 pub mod tree;
 pub mod walk;
 
-pub use config::{Config, NodeSpec};
+pub use config::{Config, NodeSpec, Rules};
 pub use finding::{Finding, Location, Report, Severity};
 pub use lean::{analyze, LeanBaseline, LeanReport};
 pub use model::{Kind, Node, NodeId, Plane};

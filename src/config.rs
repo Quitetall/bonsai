@@ -20,9 +20,34 @@ pub struct Config {
     /// The docs plane (optional) — the recursive compose executor (ADR 0134).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs: Option<DocsCfg>,
+    /// Conformance rules (optional) — the admission gate for new code (ADR 0134).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<Rules>,
     /// Authored nodes. Serialized as `[[node]]` tables.
     #[serde(default, rename = "node")]
     pub nodes: Vec<NodeSpec>,
+}
+
+/// The `[rules]` block — declarative conformance the `check` gate enforces fail-closed, so new
+/// code lands in its correct home, bounded, and coupled only downward. Every rule is opt-in
+/// (absent = inactive): a repo that declares none keeps the pure leanness ratchet. This is how
+/// Bonsai *dictates the way code is added* — growth that can't bloat or entangle the tree.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Rules {
+    /// Ordered architectural layers, **most-stable first**. A file's layer is the `layer` facet
+    /// of its nearest ancestor directory node. Dependencies must run **downward** (a higher
+    /// layer may use a lower/more-stable one, never the reverse) — the layered-architecture rule
+    /// that stops a new module from coupling upward and entangling the codebase.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
+    /// Ceiling on the number of tracked files directly inside any one directory (0 = unbounded).
+    /// Bounds growth so a directory can't silently bloat into a dumping ground.
+    #[serde(default)]
+    pub max_files_per_dir: usize,
+    /// When true, a **misplaced** file (used only from one other directory) *fails* the gate
+    /// rather than merely being reported — enforcing that code lives in its coupled home.
+    #[serde(default)]
+    pub enforce_placement: bool,
 }
 
 /// Docs-plane configuration. The docs are first-class nodes in the same tree; this points
@@ -193,6 +218,7 @@ impl Config {
         Ok(Config {
             bonsai: meta,
             docs: None,
+            rules: None,
             nodes,
         })
     }

@@ -126,6 +126,15 @@ enum Cmd {
         #[arg(long)]
         write: bool,
     },
+    /// Placement oracle: where does `<file>` belong? Ranks the directories it couples to (SCIP
+    /// coupling for an indexed file; `crate::` import-scan for a new one) and, if it's misplaced,
+    /// shows the reference-safe move to its home. The "Bonsai knows where new code goes" query.
+    Place {
+        /// The file to place (repo-relative or absolute; may be a new, not-yet-indexed file).
+        file: PathBuf,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
     /// Parse a SCIP index into the code graph (symbols, ref edges, file DAG) + print stats.
     Index {
         #[arg(long, default_value = ".")]
@@ -170,6 +179,7 @@ fn main() -> Result<()> {
         } => cmd_index(&root, scip.as_deref(), generate),
         Cmd::Ffi { root } => cmd_ffi(&root),
         Cmd::Tidy { root, write } => cmd_tidy(&root, write),
+        Cmd::Place { file, root } => cmd_place(&root, &file),
     }
 }
 
@@ -233,6 +243,110 @@ fn cmd_tidy(root: &Path, write: bool) -> Result<()> {
         println!("applied {applied}/{} proposal(s).", mis.len());
     } else {
         println!("(dry-run — pass `--write` to apply the warning-free proposals)");
+    }
+    Ok(())
+}
+
+/// The placement oracle: answer "where does `<file>` belong?" from its coupling. Prefers the
+/// exact SCIP graph signal; falls back to a `crate::`-import scan for a new, unindexed file.
+fn cmd_place(root: &Path, file: &Path) -> Result<()> {
+    let rel = file.strip_prefix(root).unwrap_or(file);
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+
+    // 1) strong signal: the SCIP coupling graph (works for an indexed file)
+    if let Some(g) = load_graph_opt(root) {
+        if let Some(p) = bonsai::place::place_existing(&g, &rel_str) {
+            println!("bonsai place — {rel_str}");
+            print_placement(&p);
+            if !p.well_placed() {
+                if let Some(home) = p.recommended() {
+                    let base = rel_str.rsplit('/').next().unwrap_or(&rel_str);
+                    let to = if home.is_empty() {
+                        base.to_string()
+                    } else {
+                        format!("{home}/{base}")
+                    };
+                    show_move_hint(root, &rel_str, &to)?;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // 2) fallback: import-scan a new / not-yet-indexed file
+    let abs = root.join(rel);
+    let content = std::fs::read_to_string(&abs).with_context(|| {
+        format!(
+            "{} is not in a SCIP index and not readable — index the repo (`bonsai index --generate`) or pass a real file",
+            abs.display()
+        )
+    })?;
+    let rs: Vec<String> = bonsai::walk::files_with_ext(root, &[], &["rs"])
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let map = bonsai::place::module_dir_map(&rs);
+    let cur = rel_str.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    match bonsai::place::place_new(&content, cur, &map) {
+        Some(p) => {
+            println!("bonsai place — {rel_str}  (new/unindexed: inferred from `crate::` imports)");
+            print_placement(&p);
+        }
+        None => println!(
+            "bonsai place — {rel_str}: no `crate::` coupling found. Place by intent, or run \
+             `bonsai index --generate` for the exact signal."
+        ),
+    }
+    Ok(())
+}
+
+/// Render a placement recommendation (signal source, current dir, home, coupling breakdown).
+fn print_placement(p: &bonsai::place::Placement) {
+    let show = |d: &str| {
+        if d.is_empty() {
+            ".".to_string()
+        } else {
+            format!("{d}/")
+        }
+    };
+    println!(
+        "  signal: {}",
+        if p.from_graph {
+            "SCIP coupling (exact)"
+        } else {
+            "crate:: import scan (heuristic)"
+        }
+    );
+    if !p.file.is_empty() {
+        println!("  currently in: {}", show(&p.current_dir));
+    }
+    if let Some(home) = p.recommended() {
+        if p.well_placed() {
+            println!("  ✓ already in its coupled home: {}", show(home));
+        } else {
+            println!("  → belongs in: {}", show(home));
+        }
+    }
+    println!("  coupling by directory:");
+    for (dir, n) in p.ranked.iter().take(6) {
+        println!("    {n:>3}×  {}", show(dir));
+    }
+}
+
+/// Print the one-line reference-safe move a misplaced file needs to reach its home.
+fn show_move_hint(root: &Path, from: &str, to: &str) -> Result<()> {
+    let ws = Workspace::from_dir(root)?;
+    let mv = Move {
+        from: PathBuf::from(from),
+        to: PathBuf::from(to),
+    };
+    if ws.files.contains_key(&mv.from) {
+        let plan = plan_move(&ws, &mv);
+        println!(
+            "\n  reference-safe move to home:\n    bonsai apply {from} {to} --write   ({} edit(s), {} warning(s))",
+            plan.edits.len(),
+            plan.warnings.len()
+        );
     }
     Ok(())
 }
@@ -598,14 +712,20 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
 fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
-    // (rule, message) per violation: tree invariants first, then ratchet regressions.
-    let mut violations: Vec<(&'static str, String)> = tree
-        .check()
-        .into_iter()
-        .map(|e| ("tree-invariant", e))
-        .collect();
+    let graph = load_graph_opt(root); // shared by the ratchet + the conformance rules
+    let mut findings: Vec<Finding> = Vec::new();
 
-    // leanness ratchet: only enforced if a baseline is committed (opt-in per repo)
+    // 1. structural invariants of the capability tree
+    for e in tree.check() {
+        findings.push(Finding::new(
+            "tree-invariant",
+            Severity::Error,
+            e,
+            Location::file(LEAN_BASELINE),
+        ));
+    }
+
+    // 2. leanness ratchet — only if a baseline is committed (opt-in per repo)
     let baseline_path = root.join(LEAN_BASELINE);
     if baseline_path.exists() {
         let baseline: bonsai::lean::LeanBaseline =
@@ -618,28 +738,28 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
         }
         let scan = bonsai::scan::Scan::run(root, &scfg);
         let mut report = bonsai::lean::analyze_from_scan(&tree, &scan);
-        report.dead_code = bonsai::lean::dead_code_count(root);
-        report.misplaced = bonsai::lean::misplacement_count(root);
+        report.dead_code = graph.as_ref().map(|g| g.dead_symbols(root, &[]).len());
+        report.misplaced = graph.as_ref().map(|g| g.misplacements().len());
         for reg in baseline.regressions(&report) {
-            violations.push(("leanness-ratchet", reg));
+            findings.push(Finding::new(
+                "leanness-ratchet",
+                Severity::Error,
+                reg,
+                Location::file(LEAN_BASELINE),
+            ));
         }
     }
 
-    // Machine formats: emit the violations as an error-severity finding stream, then fail
-    // closed if any exist (CI gets both a SARIF report and a non-zero exit).
+    // 3. conformance rules — the admission gate (layering, bounded growth, placement)
+    if let Some(rules) = &cfg.rules {
+        findings.extend(bonsai::rules::evaluate(&tree, graph.as_ref(), rules));
+    }
+
+    let report = Report::new(findings);
+
+    // Machine formats: emit the finding stream, then fail closed if any error exists
+    // (CI gets both a SARIF/JSON report and a non-zero exit).
     if format != Format::Text {
-        let findings = violations
-            .iter()
-            .map(|(rule, msg)| {
-                Finding::new(
-                    rule,
-                    Severity::Error,
-                    msg.clone(),
-                    Location::file(LEAN_BASELINE),
-                )
-            })
-            .collect();
-        let report = Report::new(findings);
         match format {
             Format::Json => println!("{}", report.to_json()),
             Format::Sarif => println!("{}", report.to_sarif()),
@@ -651,17 +771,17 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
         return Ok(());
     }
 
-    if violations.is_empty() {
+    if report.findings.is_empty() {
         println!(
-            "bonsai check: OK — {} nodes, invariants + ratchet hold",
+            "bonsai check: OK — {} nodes, invariants + ratchet + conformance hold",
             tree.nodes.len()
         );
         Ok(())
     } else {
-        for (rule, msg) in &violations {
-            println!("  ✗ [{rule}] {msg}");
+        for f in &report.findings {
+            println!("  ✗ [{}] {} — {}", f.rule, f.location.file, f.message);
         }
-        anyhow::bail!("bonsai check: {} violation(s)", violations.len());
+        anyhow::bail!("bonsai check: {} violation(s)", report.findings.len());
     }
 }
 
