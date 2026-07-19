@@ -86,6 +86,21 @@ pub struct Rules {
     /// rather than merely being reported — enforcing that code lives in its coupled home.
     #[serde(default)]
     pub enforce_placement: bool,
+    /// Ceiling on containment nesting depth (0 = unbounded). Abstractions flow top-down, but this
+    /// bounds how deep the stack goes — no infinite tower of directories/indirection.
+    #[serde(default)]
+    pub max_depth: usize,
+    /// Ceiling on the number of declared architecture `layers` (0 = unbounded). Stops the level
+    /// count itself from sprawling into abstraction hell.
+    #[serde(default)]
+    pub max_layers: usize,
+    /// **The migration valve.** Exemptions that grandfather known/in-flight violations so an
+    /// intentional change doesn't fight the gate: each entry is `rule` or `rule:path-glob`
+    /// (e.g. `"conformance-layering:legacy/**"`, `"contract-seal"`). A matching finding is
+    /// dropped from the gate and reported as *exempted* — the list itself is the audit trail, and
+    /// new (unlisted) violations still fail closed. Prune it as migrations complete.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
 }
 
 /// Docs-plane configuration. The docs are first-class nodes in the same tree; this points

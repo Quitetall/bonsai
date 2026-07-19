@@ -18,11 +18,110 @@ use std::collections::BTreeMap;
 pub fn evaluate(tree: &Tree, graph: Option<&CodeGraph>, rules: &Rules) -> Vec<Finding> {
     let mut out = Vec::new();
     bounded_growth(tree, rules, &mut out);
+    abstraction_bounds(tree, rules, &mut out);
     if let Some(g) = graph {
         layering(tree, g, rules, &mut out);
         placement(g, rules, &mut out);
     }
     out
+}
+
+/// Anti-abstraction-hell: bound how deep the abstraction stack may go. Abstractions constrain the
+/// levels beneath them, but the depth of that stack — containment nesting and the declared level
+/// count — is itself capped, so growth can't spiral into an infinite tower of indirection.
+fn abstraction_bounds(tree: &Tree, rules: &Rules, out: &mut Vec<Finding>) {
+    if rules.max_layers > 0 && rules.layers.len() > rules.max_layers {
+        out.push(
+            Finding::new(
+                "abstraction-layers",
+                Severity::Error,
+                format!(
+                    "{} architecture layers declared (ceiling {}) — collapse levels; more layers is not more structure",
+                    rules.layers.len(),
+                    rules.max_layers
+                ),
+                Location::file("bonsai.toml"),
+            )
+            .with_fix("merge adjacent layers, or raise max_layers deliberately"),
+        );
+    }
+    if rules.max_depth > 0 {
+        let depth = containment_depth(tree);
+        if depth > rules.max_depth {
+            out.push(
+                Finding::new(
+                    "abstraction-depth",
+                    Severity::Error,
+                    format!(
+                        "containment nested {depth} deep (ceiling {}) — flatten the tower of directories",
+                        rules.max_depth
+                    ),
+                    Location::file(tree.root.clone()),
+                )
+                .with_fix("hoist over-nested modules up, or raise max_depth deliberately"),
+            );
+        }
+    }
+}
+
+/// The deepest containment path length (a catamorphism; mirrors the leanness depth fold).
+fn containment_depth(tree: &Tree) -> usize {
+    let depths = tree.fold(&|node, kids: &[usize]| {
+        1 + kids.iter().copied().max().unwrap_or(0) * (node.kind == Kind::Composite) as usize
+    });
+    depths.get(&tree.root).copied().unwrap_or(0)
+}
+
+/// **The migration valve.** Partition `findings` into (kept, exempted) using the `allow` list, so
+/// a declared or in-flight exception doesn't fight the gate while new violations still fail. An
+/// entry is `rule` or `rule:path-glob`; `rule` matches an exact rule id, a `foo` prefix of a
+/// `foo-*` family, or `*`; the optional glob matches the finding's file (`*`/`**`/`pre*`/`*suf`/
+/// `dir/**`). Returns `(kept, exempted)` — the caller reports the exempted count (never silent).
+pub fn apply_allow(findings: Vec<Finding>, allow: &[String]) -> (Vec<Finding>, Vec<Finding>) {
+    if allow.is_empty() {
+        return (findings, Vec::new());
+    }
+    let mut kept = Vec::new();
+    let mut exempted = Vec::new();
+    for f in findings {
+        if allow.iter().any(|e| matches_allow(&f, e)) {
+            exempted.push(f);
+        } else {
+            kept.push(f);
+        }
+    }
+    (kept, exempted)
+}
+
+fn matches_allow(f: &Finding, entry: &str) -> bool {
+    let (rule_pat, path_pat) = match entry.split_once(':') {
+        Some((r, p)) => (r, Some(p)),
+        None => (entry, None),
+    };
+    let rule_ok =
+        rule_pat == "*" || f.rule == rule_pat || f.rule.starts_with(&format!("{rule_pat}-"));
+    if !rule_ok {
+        return false;
+    }
+    match path_pat {
+        None => true,
+        Some(g) => glob_match(g, &f.location.file),
+    }
+}
+
+/// A deliberately small path glob: `*`/`**` = any; `dir/**` or `pre*` = prefix; `*suf` = suffix;
+/// otherwise exact.
+fn glob_match(glob: &str, path: &str) -> bool {
+    if glob == "*" || glob == "**" {
+        return true;
+    }
+    if let Some(pre) = glob.strip_suffix("/**").or_else(|| glob.strip_suffix('*')) {
+        return path.starts_with(pre);
+    }
+    if let Some(suf) = glob.strip_prefix('*') {
+        return path.ends_with(suf);
+    }
+    path == glob
 }
 
 /// Bounded growth: no directory may hold more than `max_files_per_dir` tracked files directly.
@@ -235,10 +334,94 @@ facets = { layer = "cli" }
         );
     }
 
+    #[test]
+    fn abstraction_bounds_cap_layers_and_depth() {
+        // too many declared layers
+        let mut rules = Rules {
+            layers: vec!["a".into(), "b".into(), "c".into()],
+            max_layers: 2,
+            ..Default::default()
+        };
+        let tree = Config::from_toml("[bonsai]\nroot=\".\"\n")
+            .unwrap()
+            .into_tree(None)
+            .unwrap();
+        let f = evaluate(&tree, None, &rules);
+        assert!(
+            f.iter().any(|x| x.rule == "abstraction-layers"),
+            "3 layers > 2 must flag: {f:?}"
+        );
+
+        // nesting deeper than max_depth
+        rules = Rules {
+            max_depth: 1,
+            ..Default::default()
+        };
+        let mut deep = Config::from_toml("[bonsai]\nroot=\".\"\n")
+            .unwrap()
+            .into_tree(None)
+            .unwrap();
+        add_composite(&mut deep, "a", ".");
+        add_composite(&mut deep, "a/b", "a");
+        add_atom(&mut deep, "a/b/f.rs", "a/b");
+        let g = evaluate(&deep, None, &rules);
+        assert!(
+            g.iter().any(|x| x.rule == "abstraction-depth"),
+            "deep tree > max_depth 1 must flag: {g:?}"
+        );
+    }
+
+    #[test]
+    fn allow_list_exempts_matching_findings_and_reports_them() {
+        let findings = vec![
+            Finding::new(
+                "conformance-layering",
+                Severity::Error,
+                "up",
+                Location::file("legacy/x.rs"),
+            ),
+            Finding::new(
+                "conformance-layering",
+                Severity::Error,
+                "up",
+                Location::file("core/y.rs"),
+            ),
+            Finding::new(
+                "contract-seal",
+                Severity::Error,
+                "gone",
+                Location::file("codec/src"),
+            ),
+        ];
+        // exempt all layering violations under legacy/, plus every contract-seal
+        let allow = vec![
+            "conformance-layering:legacy/**".to_string(),
+            "contract-seal".to_string(),
+        ];
+        let (kept, exempted) = apply_allow(findings, &allow);
+        // core/y.rs layering stays; legacy/x.rs + the seal are exempted
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].location.file, "core/y.rs");
+        assert_eq!(exempted.len(), 2);
+    }
+
     /// Helper: attach an atom child to an existing parent, both-ways (one-home).
     fn add_atom(tree: &mut Tree, id: &str, parent: &str) {
         use crate::model::{Node, Plane};
         let mut n = Node::new(id, Kind::Atom, Plane::Code);
+        n.parent = Some(parent.to_string());
+        tree.nodes.insert(id.to_string(), n);
+        if let Some(p) = tree.nodes.get_mut(parent) {
+            if !p.children.contains(&id.to_string()) {
+                p.children.push(id.to_string());
+            }
+        }
+    }
+
+    /// Helper: attach a composite (directory) child to an existing parent.
+    fn add_composite(tree: &mut Tree, id: &str, parent: &str) {
+        use crate::model::{Node, Plane};
+        let mut n = Node::new(id, Kind::Composite, Plane::Code);
         n.parent = Some(parent.to_string());
         tree.nodes.insert(id.to_string(), n);
         if let Some(p) = tree.nodes.get_mut(parent) {

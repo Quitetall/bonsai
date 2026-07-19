@@ -869,6 +869,16 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
         findings.extend(bonsai::contracts::evaluate(&ws, &cfg.contracts));
     }
 
+    // 5. the migration valve: grandfather declared/in-flight exceptions (allow-list) so an
+    //    intentional change doesn't fight the gate — but report what was exempted (never silent).
+    let exempted = if let Some(allow) = cfg.rules.as_ref().map(|r| &r.allow) {
+        let (kept, exempted) = bonsai::rules::apply_allow(findings, allow);
+        findings = kept;
+        exempted
+    } else {
+        Vec::new()
+    };
+
     let report = Report::new(findings);
 
     // Machine formats: emit the finding stream, then fail closed if any error exists
@@ -885,17 +895,41 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
         return Ok(());
     }
 
-    if report.findings.is_empty() {
+    // The exempted list is the audit trail — always surfaced, never silent.
+    if !exempted.is_empty() {
         println!(
-            "bonsai check: OK — {} nodes, invariants + ratchet + conformance hold",
+            "  ⓘ {} finding(s) exempted by the allow-list (migration valve):",
+            exempted.len()
+        );
+        for f in exempted.iter().take(8) {
+            println!("      [{}] {}", f.rule, f.location.file);
+        }
+    }
+
+    // Warnings (e.g. premature-abstraction) are reported but do NOT fail the gate — only
+    // error-severity findings do. This keeps advisory smells from blocking a commit.
+    let (errors, warnings, _) = report.counts();
+    for f in &report.findings {
+        let glyph = if f.severity == Severity::Error {
+            "✗"
+        } else {
+            "▲"
+        };
+        println!("  {glyph} [{}] {} — {}", f.rule, f.location.file, f.message);
+    }
+    if errors == 0 {
+        let note = if warnings > 0 {
+            format!(" ({warnings} warning(s), non-blocking)")
+        } else {
+            String::new()
+        };
+        println!(
+            "bonsai check: OK — {} nodes, invariants + ratchet + conformance hold{note}",
             tree.nodes.len()
         );
         Ok(())
     } else {
-        for f in &report.findings {
-            println!("  ✗ [{}] {} — {}", f.rule, f.location.file, f.message);
-        }
-        anyhow::bail!("bonsai check: {} violation(s)", report.findings.len());
+        anyhow::bail!("bonsai check: {errors} violation(s)");
     }
 }
 

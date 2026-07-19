@@ -93,7 +93,9 @@ fn forbidden(c: &Contract, level: &str, rel: &str, text: &str, out: &mut Vec<Fin
     }
 }
 
-/// sealed seams: the abstraction's definition must still exist somewhere in the repo.
+/// sealed seams: the abstraction's definition must still exist (you extend it, you don't replace
+/// it), and — the anti-abstraction-hell guard — a sealed *trait* must be load-bearing: a trait
+/// with fewer than two implementations is speculative generality, not a seam worth freezing.
 fn sealed(ws: &Workspace, c: &Contract, level: &str, out: &mut Vec<Finding>) {
     let Some(seal) = &c.sealed else { return };
     let present = ws.files.values().any(|t| defines_type(t, seal));
@@ -107,29 +109,74 @@ fn sealed(ws: &Workspace, c: &Contract, level: &str, out: &mut Vec<Finding>) {
                 ),
                 Location::file(c.path.clone()),
             )
-            .with_fix(format!("restore `{seal}`; add capability as a new impl beneath it")),
+            // the migration valve: an intentional change isn't blocked, it's declared.
+            .with_fix(format!(
+                "if this is deliberate, update the `sealed = \"{seal}\"` declaration to the new \
+                 name (or add an `allow` exemption for the migration); otherwise restore `{seal}` \
+                 and add capability as a new impl beneath it"
+            )),
         );
+        return;
     }
+    // premature-abstraction smell: a sealed trait earns its seal by having ≥2 real users.
+    let is_trait = ws.files.values().any(|t| defines_trait(t, seal));
+    if is_trait {
+        let impls: usize = ws.files.values().map(|t| count_impls(t, seal)).sum();
+        if impls < 2 {
+            out.push(
+                Finding::new(
+                    "abstraction-premature",
+                    Severity::Warning,
+                    format!(
+                        "{level}: sealed trait `{seal}` has {impls} impl(s) — an abstraction earns its seal by having ≥2 real users; this is speculative generality"
+                    ),
+                    Location::file(c.path.clone()),
+                )
+                .with_fix("inline the abstraction until a second implementer exists, or unseal it"),
+            );
+        }
+    }
+}
+
+/// True if `text` defines a `trait` named exactly `name`.
+fn defines_trait(text: &str, name: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim_start().trim_start_matches("pub").trim_start();
+        t.strip_prefix("trait ")
+            .map(|rest| {
+                let ident: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                ident == name
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Count `impl <trait> for …` blocks for `name` in `text` (any generic form).
+fn count_impls(text: &str, name: &str) -> usize {
+    text.lines().filter(|l| impl_line_for(l, name)).count()
+}
+
+/// True if `line` is an `impl <name> for …` header (mirrors [`implements`], per line).
+fn impl_line_for(line: &str, name: &str) -> bool {
+    let t = line.trim_start();
+    let Some(rest) = t.strip_prefix("impl") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let rest = rest
+        .strip_prefix('<')
+        .and_then(|r| r.split_once('>'))
+        .map(|(_, r)| r.trim_start())
+        .unwrap_or(rest);
+    rest.starts_with(name) && rest[name.len()..].trim_start().split_once("for").is_some()
 }
 
 /// True if `text` contains an `impl <trait> for …` (any generics/where-clause form).
 fn implements(text: &str, tr: &str) -> bool {
-    text.lines().any(|l| {
-        let t = l.trim_start();
-        // `impl Codec for`, `impl<T> Codec for`, `impl Codec<X> for`
-        if let Some(rest) = t.strip_prefix("impl") {
-            let rest = rest.trim_start();
-            // skip a generic parameter list `<...>` immediately after impl
-            let rest = rest
-                .strip_prefix('<')
-                .and_then(|r| r.split_once('>'))
-                .map(|(_, r)| r.trim_start())
-                .unwrap_or(rest);
-            (rest.starts_with(tr)) && rest[tr.len()..].trim_start().split_once("for").is_some()
-        } else {
-            false
-        }
-    })
+    text.lines().any(|l| impl_line_for(l, tr))
 }
 
 /// True if `text` defines a `trait`/`struct`/`enum`/`type` named exactly `name`.
@@ -237,6 +284,42 @@ mod tests {
             f.iter()
                 .any(|x| x.rule == "contract-forbid" && x.location.line == Some(3)),
             "forbidden transmute must be flagged at its line: {f:?}"
+        );
+    }
+
+    #[test]
+    fn premature_abstraction_smell_on_single_impl_seal() {
+        // Codec exists with only ONE impl → speculative generality (warning, not a hard block).
+        let ws = Workspace::from_pairs(
+            ".",
+            [
+                ("codec/src/trait.rs", "pub trait Codec {}\n"),
+                (
+                    "codec/src/one.rs",
+                    "// WireMagic\npub struct One;\nimpl Codec for One {}\n",
+                ),
+            ],
+        );
+        let f = evaluate(&ws, &[contract()]);
+        assert!(
+            f.iter()
+                .any(|x| x.rule == "abstraction-premature" && x.severity == Severity::Warning),
+            "a sealed trait with one impl should warn: {f:?}"
+        );
+
+        // add a second implementer → the abstraction is load-bearing, no warning
+        let ws2 = Workspace::from_pairs(
+            ".",
+            [
+                ("codec/src/trait.rs", "pub trait Codec {}\n"),
+                ("codec/src/one.rs", "// WireMagic\nimpl Codec for One {}\n"),
+                ("codec/src/two.rs", "// WireMagic\nimpl Codec for Two {}\n"),
+            ],
+        );
+        let f2 = evaluate(&ws2, &[contract()]);
+        assert!(
+            !f2.iter().any(|x| x.rule == "abstraction-premature"),
+            "two impls = load-bearing seam, no smell: {f2:?}"
         );
     }
 
