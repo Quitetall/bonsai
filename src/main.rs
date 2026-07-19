@@ -178,15 +178,15 @@ fn main() -> Result<()> {
 /// used only from one other directory. Propose-by-default; `--write` executes (the structural
 /// half of refactoring, done for you). Sequester-of-dead-code is the next tidy action.
 fn cmd_tidy(root: &Path, write: bool) -> Result<()> {
-    let scip = root.join("index.scip");
-    if !scip.exists() {
+    let indices = bonsai::scip::discover_indices(root);
+    if indices.is_empty() {
         anyhow::bail!(
-            "no {} — run `bonsai index --generate` first",
-            scip.display()
+            "no *.scip index under {} — run `bonsai index --generate` first",
+            root.display()
         );
     }
-    let g = bonsai::scip::CodeGraph::from_file(&scip)
-        .with_context(|| format!("parsing {}", scip.display()))?;
+    let g = bonsai::scip::CodeGraph::from_files(&indices)
+        .with_context(|| format!("parsing {} SCIP index(es)", indices.len()))?;
     let mis = g.misplacements();
     if mis.is_empty() {
         println!("bonsai tidy: nothing to tidy — no misplaced files.");
@@ -279,10 +279,6 @@ fn cmd_ffi(root: &Path) -> Result<()> {
 /// Parse (optionally generate) a SCIP index into the code graph and report stats. The
 /// Stratum-1 substrate: exact symbol defs + reference edges + the file dependency DAG.
 fn cmd_index(root: &Path, scip: Option<&Path>, generate: bool) -> Result<()> {
-    let scip_path = scip
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| root.join("index.scip"));
-
     if generate {
         println!("bonsai index: rust-analyzer scip {}", root.display());
         let status = std::process::Command::new("rust-analyzer")
@@ -295,15 +291,30 @@ fn cmd_index(root: &Path, scip: Option<&Path>, generate: bool) -> Result<()> {
             anyhow::bail!("rust-analyzer scip failed");
         }
     }
-    if !scip_path.exists() {
+
+    // An explicit --scip pins one index; otherwise merge every *.scip under the root (polyglot).
+    let indices: Vec<PathBuf> = match scip {
+        Some(p) => vec![p.to_path_buf()],
+        None => bonsai::scip::discover_indices(root),
+    };
+    if indices.is_empty() {
         anyhow::bail!(
-            "{} not found — run with --generate, or point --scip at an index",
-            scip_path.display()
+            "no *.scip index under {} — run with --generate, or point --scip at an index",
+            root.display()
         );
     }
+    println!(
+        "bonsai index: merging {} index(es) [{}]",
+        indices.len(),
+        indices
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
-    let g = bonsai::scip::CodeGraph::from_file(&scip_path)
-        .with_context(|| format!("parsing {}", scip_path.display()))?;
+    let g = bonsai::scip::CodeGraph::from_files(&indices)
+        .with_context(|| format!("parsing {} SCIP index(es)", indices.len()))?;
 
     let files: std::collections::BTreeSet<&String> = g.symbols.values().map(|s| &s.file).collect();
     let edges: usize = g.refs.values().map(|s| s.len()).sum();
@@ -380,13 +391,14 @@ fn cmd_docs(root: &Path) -> Result<()> {
 
 const LEAN_BASELINE: &str = "bonsai.lean.json";
 
-/// Load the SCIP code graph at `<root>/index.scip` if present (for dead-code + misplacement
-/// findings); `None` when no index exists — those signals stay unmeasured, never faked.
+/// Load + merge every `*.scip` index at `root` (for dead-code + misplacement findings across a
+/// polyglot repo); `None` when no index exists — those signals stay unmeasured, never faked.
 fn load_graph_opt(root: &Path) -> Option<bonsai::scip::CodeGraph> {
-    let scip = root.join("index.scip");
-    scip.exists()
-        .then(|| bonsai::scip::CodeGraph::from_file(&scip).ok())
-        .flatten()
+    let indices = bonsai::scip::discover_indices(root);
+    if indices.is_empty() {
+        return None;
+    }
+    bonsai::scip::CodeGraph::from_files(&indices).ok()
 }
 
 /// Turn a leanness report (+ near-dups + optional code graph) into the uniform finding stream.

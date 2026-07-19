@@ -264,11 +264,11 @@ pub fn misplacement_count(root: &Path) -> Option<usize> {
 }
 
 fn load_graph(root: &Path) -> Option<crate::scip::CodeGraph> {
-    let scip = root.join("index.scip");
-    if !scip.exists() {
+    let indices = crate::scip::discover_indices(root);
+    if indices.is_empty() {
         return None;
     }
-    crate::scip::CodeGraph::from_file(&scip).ok()
+    crate::scip::CodeGraph::from_files(&indices).ok()
 }
 
 /// Near-duplicate file pairs (similar but not byte-identical). Convenience wrapper that runs

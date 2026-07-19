@@ -91,6 +91,32 @@ impl CodeGraph {
         Ok(Self::from_index(&index))
     }
 
+    /// Parse and **merge** several `.scip` indices into one cross-language graph — a polyglot
+    /// monorepo emits one index per language (rust-analyzer `index.scip`, scip-python,
+    /// scip-typescript, scip-clang, scip-java). SCIP symbol ids are globally unique (they
+    /// encode package + language), so a union is correct: the file-dependency DAG, misplacement
+    /// fold, and stats then span every language. (Cross-language edges — a Python call into a
+    /// Rust extension — come from the FFI stitcher, not SCIP, which indexes each language alone.)
+    pub fn from_files(paths: &[std::path::PathBuf]) -> anyhow::Result<Self> {
+        let mut merged = CodeGraph::default();
+        for p in paths {
+            merged.merge(CodeGraph::from_file(p)?);
+        }
+        Ok(merged)
+    }
+
+    /// Union another graph into this one (see [`from_files`](Self::from_files)).
+    fn merge(&mut self, other: CodeGraph) {
+        self.symbols.extend(other.symbols);
+        for (k, v) in other.refs {
+            self.refs.entry(k).or_default().extend(v);
+        }
+        for (k, v) in other.file_deps {
+            self.file_deps.entry(k).or_default().extend(v);
+        }
+        self.occurrences += other.occurrences;
+    }
+
     /// Build the graph from an in-memory SCIP index (also the test entry point).
     pub fn from_index(index: &Index) -> Self {
         let mut g = CodeGraph::default();
@@ -220,6 +246,11 @@ impl CodeGraph {
     /// Symbols inside a `#[cfg(test)]` region are excluded (they are live via the test
     /// harness, not the API). `kinds`, when non-empty, restricts to those SCIP Kind values.
     /// The result is deliberately conservative — pub/impl/test are never reported dead.
+    ///
+    /// Restricted to **Rust** (`.rs`) symbols: liveness here rests on a Rust-specific source
+    /// heuristic (`pub`/`impl Trait for`), so in a merged polyglot graph a Python or TypeScript
+    /// symbol — where that heuristic is meaningless — is never reported dead (a false positive
+    /// the user would rightly hate). The file DAG + misplacement fold still span all languages.
     pub fn dead_symbols(&self, root: &Path, kinds: &[i32]) -> Vec<&Sym> {
         let reach = self.reachable(&self.public_roots(root));
         let mut test_from: BTreeMap<String, Option<usize>> = BTreeMap::new();
@@ -228,6 +259,7 @@ impl CodeGraph {
             .iter()
             .filter(|(id, _)| !reach.contains(*id))
             .map(|(_, s)| s)
+            .filter(|s| s.file.ends_with(".rs"))
             .filter(|s| kinds.is_empty() || kinds.contains(&s.kind))
             .filter(|s| {
                 let cutoff = test_from
@@ -306,6 +338,21 @@ fn dir_of(path: &str) -> &str {
     path.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
 }
 
+/// Discover the SCIP indices at a repo root: every `*.scip` file directly under `root`
+/// (rust-analyzer writes `index.scip`; scip-python / scip-typescript / scip-clang / scip-java
+/// each write their own). Sorted for deterministic merge order. Empty = no index present.
+pub fn discover_indices(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("scip"))
+        .collect();
+    out.sort();
+    out
+}
+
 /// SCIP marks function-local symbols with a `local ` prefix — those are never dead-code or
 /// cross-file dependencies, so we drop them from the graph.
 fn is_local_scope(symbol: &str) -> bool {
@@ -316,7 +363,10 @@ fn is_local_scope(symbol: &str) -> bool {
 /// whether it is a *trait* impl (`impl Trait for Type`). Trait-impl methods are dispatch
 /// entry points — live even with zero recorded reference edges.
 fn enclosing_impl_is_trait(lines: &[String], def_line: usize) -> bool {
-    let mut i = def_line.min(lines.len().saturating_sub(1));
+    if lines.is_empty() {
+        return false; // source file missing/unreadable — can't determine; conservatively "no"
+    }
+    let mut i = def_line.min(lines.len() - 1);
     loop {
         let t = lines[i].trim_start();
         if t.starts_with("impl ") || t.starts_with("impl<") {
@@ -473,5 +523,72 @@ mod tests {
         idx.documents.push(d);
         let g = CodeGraph::from_index(&idx);
         assert!(g.symbols.is_empty());
+    }
+
+    #[test]
+    fn merges_polyglot_indices_and_guards_dead_code() {
+        use protobuf::Message;
+        let dir = std::env::temp_dir().join("bonsai_scip_merge");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Rust index: a.rs defines a private, unreferenced symbol → dead.
+        let mut a = Document::new();
+        a.relative_path = "a.rs".into();
+        a.occurrences.push(occ(
+            "rustpkg/dead_rs#",
+            vec![0, 3, 0, 10],
+            true,
+            vec![0, 0, 2, 0],
+        ));
+        let mut ridx = Index::new();
+        ridx.documents.push(a);
+        std::fs::write(dir.join("index.scip"), ridx.write_to_bytes().unwrap()).unwrap();
+
+        // Python index: b.py defines an unreferenced symbol → must NOT be flagged (non-.rs;
+        // the Rust visibility heuristic is meaningless there, so no false positive).
+        let mut b = Document::new();
+        b.relative_path = "b.py".into();
+        b.occurrences.push(occ(
+            "pypkg/dead_py#",
+            vec![0, 4, 0, 11],
+            true,
+            vec![0, 0, 2, 0],
+        ));
+        let mut pidx = Index::new();
+        pidx.documents.push(b);
+        std::fs::write(
+            dir.join("index.python.scip"),
+            pidx.write_to_bytes().unwrap(),
+        )
+        .unwrap();
+
+        let indices = discover_indices(&dir);
+        assert_eq!(
+            indices.len(),
+            2,
+            "should discover both .scip files: {indices:?}"
+        );
+        let g = CodeGraph::from_files(&indices).unwrap();
+        assert!(
+            g.symbols.contains_key("rustpkg/dead_rs#"),
+            "rust symbol merged"
+        );
+        assert!(
+            g.symbols.contains_key("pypkg/dead_py#"),
+            "python symbol merged"
+        );
+
+        let dead = g.dead_symbols(&dir, &[]);
+        let files: Vec<&str> = dead.iter().map(|s| s.file.as_str()).collect();
+        assert!(
+            files.contains(&"a.rs"),
+            "rust dead symbol should be flagged: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.ends_with(".py")),
+            "python symbol must never be reported dead: {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
