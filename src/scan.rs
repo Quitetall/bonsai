@@ -70,6 +70,11 @@ impl ScanConfig {
         self.extra_skip = extra.to_vec();
         self
     }
+    /// Override the read cap (files larger than this are stat-counted but not hashed).
+    pub fn max_bytes(mut self, n: u64) -> Self {
+        self.max_file_bytes = n;
+        self
+    }
     /// Enable the incremental cache at `path`.
     pub fn with_cache(mut self, path: impl Into<PathBuf>) -> Self {
         self.cache_path = Some(path.into());
@@ -202,18 +207,31 @@ fn read_facts(
 ) -> (FileFacts, bool) {
     let subrepo = walk::subrepo_of(rel, subrepos).to_path_buf();
     let abs = root.join(rel);
-    let fp = cache::stat_fingerprint(&abs);
-    let size = fp.map(|(s, _)| s).unwrap_or(0);
 
     let mut facts = FileFacts {
         rel: rel.to_path_buf(),
         subrepo,
-        size,
+        size: 0,
         is_binary: false,
         hash: None,
         lines: 0,
         shingles: Vec::new(),
     };
+
+    // Skip symlinks: never follow them. Following would (a) let a symlink pointing at a tracked
+    // file masquerade as a duplicate of its own target, and (b) risk traversing a cycle. A
+    // symlink carries no content of its own, so it is simply excluded (size 0, no hash) — not
+    // counted as unreadable.
+    if std::fs::symlink_metadata(&abs)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return (facts, false);
+    }
+
+    let fp = cache::stat_fingerprint(&abs);
+    facts.size = fp.map(|(s, _)| s).unwrap_or(0);
+    let size = facts.size;
 
     // Cache hit: reuse the stored fingerprint without reading the file.
     if let (Some(cache), Some((size, mtime))) = (cache, fp) {
