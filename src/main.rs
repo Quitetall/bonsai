@@ -258,10 +258,14 @@ fn cmd_lean(root: &Path, save: bool) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
     let mut r = bonsai::lean::analyze(&tree, root);
-    // measure dead-code from a SCIP index if present (moves it out of "deferred")
+    // measure SCIP-backed signals if an index is present (moves them out of "deferred")
     r.dead_code = bonsai::lean::dead_code_count(root);
+    r.misplaced = bonsai::lean::misplacement_count(root);
     if r.dead_code.is_some() {
         r.deferred.retain(|d| !d.starts_with("dead-code"));
+    }
+    if r.misplaced.is_some() {
+        r.deferred.retain(|d| !d.starts_with("misplacement"));
     }
 
     println!(
@@ -270,6 +274,9 @@ fn cmd_lean(root: &Path, save: bool) -> Result<()> {
     );
     if let Some(n) = r.dead_code {
         println!("  dead symbols   : {n}  (SCIP-measured)");
+    }
+    if let Some(n) = r.misplaced {
+        println!("  misplaced files: {n}  (SCIP-measured)");
     }
     println!(
         "  leanness score : {:.4}  (1.0 = no measured waste)",
@@ -281,6 +288,11 @@ fn cmd_lean(root: &Path, save: bool) -> Result<()> {
         r.dup_groups.len(),
         r.wasted_loc()
     );
+    let near = bonsai::lean::near_duplicates(&tree, root, 0.85);
+    println!("  near-duplicates: {} pair(s) (≥0.85 similar, not identical)", near.len());
+    for nd in near.iter().take(8) {
+        println!("    {:.0}%  {}  ~  {}", nd.similarity * 100.0, nd.a, nd.b);
+    }
     println!("  empty dirs     : {}", r.empty_dirs.len());
     for g in r.dup_groups.iter().take(12) {
         println!("    ×{}  {}", g.files.len(), g.files.join("  ≡  "));
@@ -297,9 +309,13 @@ fn cmd_lean(root: &Path, save: bool) -> Result<()> {
             if r.empty_dirs.len() > 8 { " …" } else { "" }
         );
     }
-    println!("  deferred (need SCIP, reported as unmeasured — never faked as 0):");
-    for d in &r.deferred {
-        println!("    · {d}");
+    if r.deferred.is_empty() {
+        println!("  deferred       : none — every signal measured");
+    } else {
+        println!("  deferred (unmeasured — never faked as 0):");
+        for d in &r.deferred {
+            println!("    · {d}");
+        }
     }
 
     if save {
@@ -327,6 +343,7 @@ fn cmd_check(root: &Path) -> Result<()> {
                 .with_context(|| format!("parsing {LEAN_BASELINE}"))?;
         let mut report = bonsai::lean::analyze(&tree, root);
         report.dead_code = bonsai::lean::dead_code_count(root);
+        report.misplaced = bonsai::lean::misplacement_count(root);
         for reg in baseline.regressions(&report) {
             errs.push(format!("leanness ratchet: {reg}"));
         }

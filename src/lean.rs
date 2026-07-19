@@ -13,7 +13,7 @@ use crate::model::Kind;
 use crate::tree::Tree;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
@@ -22,6 +22,14 @@ use std::path::Path;
 pub struct DupGroup {
     pub files: Vec<String>,
     pub loc: usize,
+}
+
+/// A pair of files that are highly similar but not byte-identical (a near-clone).
+#[derive(Debug, Clone)]
+pub struct NearDup {
+    pub a: String,
+    pub b: String,
+    pub similarity: f64,
 }
 
 /// The leanness snapshot. Counts are exact; the score is a relative composite in `[0,1]`.
@@ -37,6 +45,9 @@ pub struct LeanReport {
     /// Dead internal symbols (unreachable from the public API) — `Some` only when a SCIP
     /// index is present; `None` = unmeasured (never faked as 0).
     pub dead_code: Option<usize>,
+    /// Misplaced files (used only from one other directory) — `Some` only when a SCIP index
+    /// is present; `None` = unmeasured.
+    pub misplaced: Option<usize>,
     /// Signals that still need the SCIP graph — reported as unmeasured, never as zero.
     pub deferred: Vec<&'static str>,
 }
@@ -81,7 +92,6 @@ pub fn analyze(tree: &Tree, root: &Path) -> LeanReport {
         deferred: vec![
             "dead-code (reachability — needs SCIP)",
             "misplacement (coupling fold — needs the dependency graph)",
-            "near-duplicate (token/AST similarity — first cut is exact-match only)",
         ],
         ..Default::default()
     };
@@ -163,6 +173,9 @@ pub struct LeanBaseline {
     /// Ratcheted dead-symbol ceiling (only present once measured via SCIP).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_dead: Option<usize>,
+    /// Ratcheted misplaced-file ceiling (only present once measured via SCIP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_misplaced: Option<usize>,
 }
 
 impl LeanBaseline {
@@ -172,6 +185,7 @@ impl LeanBaseline {
             max_dup_files: r.dup_files(),
             max_empty_dirs: r.empty_dirs.len(),
             max_dead: r.dead_code,
+            max_misplaced: r.misplaced,
         }
     }
 
@@ -200,10 +214,15 @@ impl LeanBaseline {
                 self.max_empty_dirs
             ));
         }
-        // dead-code ratchet only when both baseline and current are measured
+        // dead-code / misplacement ratchets only when both baseline and current are measured
         if let (Some(cur), Some(max)) = (r.dead_code, self.max_dead) {
             if cur > max {
                 v.push(format!("dead symbols {cur} > baseline {max}"));
+            }
+        }
+        if let (Some(cur), Some(max)) = (r.misplaced, self.max_misplaced) {
+            if cur > max {
+                v.push(format!("misplaced files {cur} > baseline {max}"));
             }
         }
         v
@@ -214,12 +233,94 @@ impl LeanBaseline {
 /// `None` = no index → unmeasured (never faked as 0). Turns the "deferred" dead-code
 /// signal into a real, ratchetable measurement when the graph is available.
 pub fn dead_code_count(root: &Path) -> Option<usize> {
+    let g = load_graph(root)?;
+    Some(g.dead_symbols(root, &[]).len())
+}
+
+/// Count misplaced files (used only from one other directory) via the SCIP index, if present.
+pub fn misplacement_count(root: &Path) -> Option<usize> {
+    Some(load_graph(root)?.misplacements().len())
+}
+
+fn load_graph(root: &Path) -> Option<crate::scip::CodeGraph> {
     let scip = root.join("index.scip");
     if !scip.exists() {
         return None;
     }
-    let g = crate::scip::CodeGraph::from_file(&scip).ok()?;
-    Some(g.dead_symbols(root, &[]).len())
+    crate::scip::CodeGraph::from_file(&scip).ok()
+}
+
+/// Near-duplicate file pairs (similar but not byte-identical) via normalized-line shingling
+/// with a shared-line inverted index (so it stays near-linear instead of O(n²)). A pair is
+/// a near-dup when its line-set Jaccard is ≥ `threshold` and below 1.0 (exact dups are
+/// reported separately). Boilerplate lines shared by many files are dropped as stop-shingles.
+pub fn near_duplicates(tree: &Tree, root: &Path, threshold: f64) -> Vec<NearDup> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    const MIN_LINES: usize = 8; // ignore tiny files (too little signal)
+    const MAX_DF: usize = 40; // a line in >40 files is boilerplate → skip
+    const MIN_SHARED: usize = 5; // candidate pairs must share ≥5 non-trivial lines
+
+    // per-file normalized line-hash set
+    let mut paths: Vec<String> = Vec::new();
+    let mut sets: Vec<BTreeSet<u64>> = Vec::new();
+    for node in tree.nodes.values() {
+        if node.kind != Kind::Atom {
+            continue;
+        }
+        let Some(anchor) = node.anchors.first() else { continue };
+        let Ok(text) = std::fs::read_to_string(root.join(anchor)) else { continue };
+        let mut set = BTreeSet::new();
+        for line in text.lines() {
+            let t = line.trim();
+            if t.len() < 4 || t == "}" || t == "{" || t == ")" {
+                continue; // structural noise
+            }
+            let mut h = DefaultHasher::new();
+            t.hash(&mut h);
+            set.insert(h.finish());
+        }
+        if set.len() >= MIN_LINES {
+            paths.push(anchor.clone());
+            sets.push(set);
+        }
+    }
+
+    // inverted index: line-hash → files containing it (dropping stop-shingles)
+    let mut inv: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for (i, set) in sets.iter().enumerate() {
+        for &h in set {
+            inv.entry(h).or_default().push(i);
+        }
+    }
+    // candidate pair → shared-line count
+    let mut shared: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for files in inv.values() {
+        if files.len() > MAX_DF {
+            continue;
+        }
+        for a in 0..files.len() {
+            for b in (a + 1)..files.len() {
+                *shared.entry((files[a], files[b])).or_default() += 1;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for ((i, j), n) in shared {
+        if n < MIN_SHARED {
+            continue;
+        }
+        let (si, sj) = (&sets[i], &sets[j]);
+        let inter = si.intersection(sj).count();
+        let union = si.len() + sj.len() - inter;
+        let jac = inter as f64 / union.max(1) as f64;
+        if jac >= threshold && jac < 1.0 {
+            out.push(NearDup { a: paths[i].clone(), b: paths[j].clone(), similarity: jac });
+        }
+    }
+    out.sort_by(|x, y| y.similarity.partial_cmp(&x.similarity).unwrap());
+    out
 }
 
 #[cfg(test)]
@@ -262,6 +363,21 @@ mod tests {
     }
 
     #[test]
+    fn near_dup_detects_similar_not_identical() {
+        let base = probe_dir("neardup");
+        let body: String = (0..20).map(|i| format!("let v{i} = compute({i});\n")).collect();
+        // two files differing only in the last line → high Jaccard, not identical
+        fs::write(base.join("a/x.rs"), format!("{body}return v0;\n")).unwrap();
+        fs::write(base.join("b/y.rs"), format!("{body}return v19;\n")).unwrap();
+        let cfg = Config::from_dir(&base).unwrap();
+        let tree = cfg.into_tree(Some(&base)).unwrap();
+        let nd = near_duplicates(&tree, &base, 0.8);
+        assert_eq!(nd.len(), 1, "{nd:?}");
+        assert!(nd[0].similarity > 0.8 && nd[0].similarity < 1.0);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn ratchet_flags_regression() {
         let base = probe_dir("ratchet");
         let cfg = Config::from_dir(&base).unwrap();
@@ -276,6 +392,7 @@ mod tests {
             max_dup_files: 0,
             max_empty_dirs: 0,
             max_dead: None,
+            max_misplaced: None,
         };
         assert!(!strict.regressions(&r).is_empty());
         let _ = fs::remove_dir_all(&base);

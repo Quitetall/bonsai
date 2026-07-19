@@ -205,6 +205,38 @@ impl CodeGraph {
         dead
     }
 
+    /// Misplacement (the coupling "belongs-in" signal, ADR 0134): a file whose symbols are
+    /// referenced **exclusively** from one *other* directory belongs in that directory. Uses
+    /// the file-dependency DAG's reverse edges. Deliberately conservative — it only fires
+    /// when every dependent sits in a single directory that isn't the file's own, so a shared
+    /// utility used from many places is never flagged.
+    pub fn misplacements(&self) -> Vec<Misplacement> {
+        let mut rdeps: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (from, tos) in &self.file_deps {
+            for to in tos {
+                rdeps.entry(to.clone()).or_default().insert(from.clone());
+            }
+        }
+        let mut out = Vec::new();
+        for (file, dependents) in &rdeps {
+            let cur = dir_of(file);
+            let dirs: BTreeSet<&str> = dependents.iter().map(|d| dir_of(d)).collect();
+            if dirs.len() == 1 {
+                let suggested = *dirs.iter().next().unwrap();
+                if suggested != cur {
+                    out.push(Misplacement {
+                        file: file.clone(),
+                        current_dir: cur.to_string(),
+                        suggested_dir: suggested.to_string(),
+                        dependents: dependents.len(),
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| a.file.cmp(&b.file));
+        out
+    }
+
     /// Symbols reachable from `entry` symbols by following reference edges (BFS closure).
     pub fn reachable(&self, entry: &BTreeSet<String>) -> BTreeSet<String> {
         let mut seen: BTreeSet<String> = entry.clone();
@@ -220,6 +252,20 @@ impl CodeGraph {
         }
         seen
     }
+}
+
+/// A file whose symbols are used only from a single other directory (a relocation suggestion).
+#[derive(Debug, Clone)]
+pub struct Misplacement {
+    pub file: String,
+    pub current_dir: String,
+    pub suggested_dir: String,
+    pub dependents: usize,
+}
+
+/// The directory portion of a repo-relative path (`""` for a top-level file).
+fn dir_of(path: &str) -> &str {
+    path.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
 }
 
 /// SCIP marks function-local symbols with a `local ` prefix — those are never dead-code or
@@ -303,6 +349,31 @@ mod tests {
         let entry: BTreeSet<String> = ["bar#".to_string()].into_iter().collect();
         let reach = g.reachable(&entry);
         assert!(reach.contains("foo#") && reach.contains("bar#"));
+    }
+
+    #[test]
+    fn misplacement_flags_single_consumer_dir() {
+        // util/helper.rs is referenced only from feature/*.rs → belongs under feature/.
+        let mut g = CodeGraph::default();
+        g.file_deps
+            .entry("feature/a.rs".into())
+            .or_default()
+            .insert("util/helper.rs".into());
+        g.file_deps
+            .entry("feature/b.rs".into())
+            .or_default()
+            .insert("util/helper.rs".into());
+        let m = g.misplacements();
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].file, "util/helper.rs");
+        assert_eq!(m[0].suggested_dir, "feature");
+
+        // add a same-dir consumer → no longer exclusively external → not flagged
+        g.file_deps
+            .entry("util/other.rs".into())
+            .or_default()
+            .insert("util/helper.rs".into());
+        assert!(g.misplacements().is_empty(), "shared util must not be flagged");
     }
 
     #[test]
