@@ -34,7 +34,10 @@ pub struct LeanReport {
     /// Exact-duplicate content groups (non-empty files only).
     pub dup_groups: Vec<DupGroup>,
     pub max_depth: usize,
-    /// Signals that need the SCIP graph — reported as unmeasured, never as zero.
+    /// Dead internal symbols (unreachable from the public API) — `Some` only when a SCIP
+    /// index is present; `None` = unmeasured (never faked as 0).
+    pub dead_code: Option<usize>,
+    /// Signals that still need the SCIP graph — reported as unmeasured, never as zero.
     pub deferred: Vec<&'static str>,
 }
 
@@ -157,6 +160,9 @@ pub struct LeanBaseline {
     pub min_score: f64,
     pub max_dup_files: usize,
     pub max_empty_dirs: usize,
+    /// Ratcheted dead-symbol ceiling (only present once measured via SCIP).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_dead: Option<usize>,
 }
 
 impl LeanBaseline {
@@ -165,6 +171,7 @@ impl LeanBaseline {
             min_score: r.score(),
             max_dup_files: r.dup_files(),
             max_empty_dirs: r.empty_dirs.len(),
+            max_dead: r.dead_code,
         }
     }
 
@@ -193,8 +200,26 @@ impl LeanBaseline {
                 self.max_empty_dirs
             ));
         }
+        // dead-code ratchet only when both baseline and current are measured
+        if let (Some(cur), Some(max)) = (r.dead_code, self.max_dead) {
+            if cur > max {
+                v.push(format!("dead symbols {cur} > baseline {max}"));
+            }
+        }
         v
     }
+}
+
+/// Count dead internal symbols via the SCIP index at `<root>/index.scip`, if present.
+/// `None` = no index → unmeasured (never faked as 0). Turns the "deferred" dead-code
+/// signal into a real, ratchetable measurement when the graph is available.
+pub fn dead_code_count(root: &Path) -> Option<usize> {
+    let scip = root.join("index.scip");
+    if !scip.exists() {
+        return None;
+    }
+    let g = crate::scip::CodeGraph::from_file(&scip).ok()?;
+    Some(g.dead_symbols(root, &[]).len())
 }
 
 #[cfg(test)]

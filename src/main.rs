@@ -86,6 +86,17 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
+    /// Parse a SCIP index into the code graph (symbols, ref edges, file DAG) + print stats.
+    Index {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Path to the `.scip` file (default: `<root>/index.scip`).
+        #[arg(long)]
+        scip: Option<PathBuf>,
+        /// Generate the index first via `rust-analyzer scip .`.
+        #[arg(long)]
+        generate: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -103,7 +114,74 @@ fn main() -> Result<()> {
         Cmd::Lean { root, save } => cmd_lean(&root, save),
         Cmd::Check { root } => cmd_check(&root),
         Cmd::Docs { root } => cmd_docs(&root),
+        Cmd::Index { root, scip, generate } => cmd_index(&root, scip.as_deref(), generate),
     }
+}
+
+/// Parse (optionally generate) a SCIP index into the code graph and report stats. The
+/// Stratum-1 substrate: exact symbol defs + reference edges + the file dependency DAG.
+fn cmd_index(root: &Path, scip: Option<&Path>, generate: bool) -> Result<()> {
+    let scip_path = scip
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join("index.scip"));
+
+    if generate {
+        println!("bonsai index: rust-analyzer scip {}", root.display());
+        let status = std::process::Command::new("rust-analyzer")
+            .arg("scip")
+            .arg(".")
+            .current_dir(root)
+            .status()
+            .context("running `rust-analyzer scip .` (is rust-analyzer installed?)")?;
+        if !status.success() {
+            anyhow::bail!("rust-analyzer scip failed");
+        }
+    }
+    if !scip_path.exists() {
+        anyhow::bail!(
+            "{} not found — run with --generate, or point --scip at an index",
+            scip_path.display()
+        );
+    }
+
+    let g = bonsai::scip::CodeGraph::from_file(&scip_path)
+        .with_context(|| format!("parsing {}", scip_path.display()))?;
+
+    let files: std::collections::BTreeSet<&String> = g.symbols.values().map(|s| &s.file).collect();
+    let edges: usize = g.refs.values().map(|s| s.len()).sum();
+    let dep_edges: usize = g.file_deps.values().map(|s| s.len()).sum();
+    println!(
+        "bonsai index — {} symbols across {} files, {} ref edges, {} refs seen",
+        g.symbols.len(),
+        files.len(),
+        edges,
+        g.occurrences
+    );
+    println!("  file dependency edges: {dep_edges}");
+
+    // most-referenced local symbols (fan-in) — where the code concentrates its use
+    let mut fan_in: BTreeMap<String, usize> = BTreeMap::new();
+    for outs in g.refs.values() {
+        for o in outs {
+            *fan_in.entry(o.clone()).or_default() += 1;
+        }
+    }
+    let mut ranked: Vec<(&String, usize)> = fan_in.iter().map(|(k, v)| (k, *v)).collect();
+    ranked.sort_by_key(|(_, v)| std::cmp::Reverse(*v));
+    println!("  top fan-in symbols:");
+    for (sym, n) in ranked.into_iter().take(8) {
+        let name = g.symbols.get(sym).map(|s| s.display.as_str()).filter(|s| !s.is_empty());
+        println!("    {n:>3}×  {}", name.unwrap_or(sym));
+    }
+
+    // dead code: unreachable from the public API + main (all kinds, for inspection)
+    let dead = g.dead_symbols(root, &[]);
+    println!("  dead (unreachable from pub API + main): {}", dead.len());
+    for s in dead.iter().take(20) {
+        let name = if s.display.is_empty() { "?" } else { &s.display };
+        println!("    kind {:>2}  {}:{}  {name}", s.kind, s.file, s.def.sl + 1);
+    }
+    Ok(())
 }
 
 /// Run the docs-plane compose executor (a first-class member of the same tree). The docs
@@ -134,12 +212,20 @@ const LEAN_BASELINE: &str = "bonsai.lean.json";
 fn cmd_lean(root: &Path, save: bool) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
-    let r = bonsai::lean::analyze(&tree, root);
+    let mut r = bonsai::lean::analyze(&tree, root);
+    // measure dead-code from a SCIP index if present (moves it out of "deferred")
+    r.dead_code = bonsai::lean::dead_code_count(root);
+    if r.dead_code.is_some() {
+        r.deferred.retain(|d| !d.starts_with("dead-code"));
+    }
 
     println!(
         "bonsai lean — {} files, {} composites, depth {}",
         r.files, r.composites, r.max_depth
     );
+    if let Some(n) = r.dead_code {
+        println!("  dead symbols   : {n}  (SCIP-measured)");
+    }
     println!(
         "  leanness score : {:.4}  (1.0 = no measured waste)",
         r.score()
@@ -194,7 +280,8 @@ fn cmd_check(root: &Path) -> Result<()> {
         let baseline: bonsai::lean::LeanBaseline =
             serde_json::from_str(&std::fs::read_to_string(&baseline_path)?)
                 .with_context(|| format!("parsing {LEAN_BASELINE}"))?;
-        let report = bonsai::lean::analyze(&tree, root);
+        let mut report = bonsai::lean::analyze(&tree, root);
+        report.dead_code = bonsai::lean::dead_code_count(root);
         for reg in baseline.regressions(&report) {
             errs.push(format!("leanness ratchet: {reg}"));
         }

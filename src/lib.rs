@@ -16,10 +16,12 @@ pub mod config;
 pub mod lean;
 pub mod model;
 pub mod moves;
+pub mod scip;
 pub mod tree;
 
 pub use config::{Config, NodeSpec};
 pub use lean::{analyze, LeanBaseline, LeanReport};
+pub use scip::CodeGraph;
 pub use model::{Kind, Node, NodeId, Plane};
 pub use moves::{Move, MovePlan, ReferenceResolver, RustModuleResolver, Workspace};
 pub use tree::Tree;
