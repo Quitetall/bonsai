@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use bonsai::config::Config;
 use bonsai::model::{Kind, NodeId, Plane};
-use bonsai::moves::{plan_move, Edit, EditKind, Move, MovePlan, Workspace};
+use bonsai::moves::{plan_move, Edit, Move, MovePlan, Workspace};
 use bonsai::tree::Tree;
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
@@ -568,8 +568,9 @@ fn cmd_move(root: &Path, from: &Path, to: &Path, write: bool) -> Result<()> {
     Ok(())
 }
 
-/// Apply a plan to disk: rewrite references line-by-line, then move the file. Edits are
-/// applied per file from the bottom up so earlier line numbers stay valid.
+/// Apply a plan to disk: rewrite references (byte-exact, CRLF-preserving), then move the file.
+/// Each file's edits are validated up front — a stale plan aborts with no partial write — and
+/// every write is atomic (temp file + rename) so a crash mid-apply can't leave a torn file.
 fn apply_plan(root: &Path, plan: &MovePlan) -> Result<()> {
     use std::collections::BTreeMap;
     let mut by_file: BTreeMap<PathBuf, Vec<&Edit>> = BTreeMap::new();
@@ -580,24 +581,14 @@ fn apply_plan(root: &Path, plan: &MovePlan) -> Result<()> {
         let abs = root.join(&path);
         let text =
             std::fs::read_to_string(&abs).with_context(|| format!("reading {}", abs.display()))?;
-        let mut lines: Vec<String> = text.lines().map(String::from).collect();
-        // apply deletes/replaces high-line-first; collect inserts to splice after.
-        let mut sorted = edits.clone();
-        sorted.sort_by_key(|e| std::cmp::Reverse(e.line));
-        for e in &sorted {
-            match e.kind {
-                EditKind::Replace => lines[e.line - 1] = e.after.clone(),
-                EditKind::Delete => {
-                    lines.remove(e.line - 1);
-                }
-                EditKind::Insert => lines.insert(e.line, e.after.clone()),
-            }
-        }
-        let mut out = lines.join("\n");
-        if text.ends_with('\n') {
-            out.push('\n');
-        }
-        std::fs::write(&abs, out).with_context(|| format!("writing {}", abs.display()))?;
+        let out = bonsai::moves::apply_edits(&text, &edits).map_err(|bad| {
+            anyhow::anyhow!(
+                "stale plan: {} references out-of-range line(s) {:?} (re-run the plan)",
+                abs.display(),
+                bad
+            )
+        })?;
+        atomic_write(&abs, out.as_bytes()).with_context(|| format!("writing {}", abs.display()))?;
     }
     if let Some(mv) = &plan.mv {
         let (src, dst) = (root.join(&mv.from), root.join(&mv.to));
@@ -608,6 +599,25 @@ fn apply_plan(root: &Path, plan: &MovePlan) -> Result<()> {
             .with_context(|| format!("moving {} → {}", src.display(), dst.display()))?;
     }
     Ok(())
+}
+
+/// Write `bytes` to `path` atomically: a sibling temp file, fsync-free, then a rename over the
+/// target (atomic on POSIX within one filesystem). A crash leaves either the old or new file
+/// intact, never a half-written one.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.bonsai-tmp.{}",
+        path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, bytes)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp); // don't leak the temp on failure
+            Err(e)
+        }
+    }
 }
 
 /// Render the capability tree from the model. Composites show a subtree file count (a

@@ -385,6 +385,116 @@ fn is_ident_byte(b: u8) -> bool {
     b == b'_' || b.is_ascii_alphanumeric()
 }
 
+// ─────────────────────────── byte-exact edit application ───────────────────────────
+
+/// One source line split from its exact terminator, so a rewrite round-trips byte-for-byte.
+struct Line {
+    text: String,
+    /// The line's terminator: `"\r\n"`, `"\n"`, or `""` (a final line with no trailing newline).
+    term: &'static str,
+}
+
+/// Split `text` into lines the way [`str::lines`] enumerates them (which is how `plan_move`
+/// numbers edits), but **preserving each line's exact terminator** — so a CRLF file stays CRLF
+/// and a file with no trailing newline keeps that property. `lines().join("\n")` (the old
+/// apply) silently normalized both, corrupting Windows-authored files.
+fn split_lines(text: &str) -> Vec<Line> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(i) = rest.find('\n') {
+        let line = &rest[..i];
+        let (content, term) = if let Some(stripped) = line.strip_suffix('\r') {
+            (stripped, "\r\n")
+        } else {
+            (line, "\n")
+        };
+        out.push(Line {
+            text: content.to_string(),
+            term,
+        });
+        rest = &rest[i + 1..];
+    }
+    if !rest.is_empty() {
+        out.push(Line {
+            text: rest.to_string(),
+            term: "",
+        }); // final unterminated line
+    }
+    out
+}
+
+/// The file's dominant line terminator (majority CRLF vs LF), for newly-inserted lines.
+fn dominant_term(lines: &[Line]) -> &'static str {
+    let crlf = lines.iter().filter(|l| l.term == "\r\n").count();
+    let lf = lines.iter().filter(|l| l.term == "\n").count();
+    if crlf > lf {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+/// Apply `edits` (for a SINGLE file) to `text`, preserving every untouched byte and each line's
+/// exact terminator. Edits use 1-indexed line numbers as produced by [`plan_move`]. Returns
+/// `Err(out_of_range_lines)` if any edit references a line past the end (a stale plan) — the
+/// caller then aborts with no partial write, instead of the old code's out-of-bounds panic.
+pub fn apply_edits(text: &str, edits: &[&Edit]) -> Result<String, Vec<usize>> {
+    let mut lines = split_lines(text);
+    let dominant = dominant_term(&lines);
+
+    // Validate first: Replace/Delete need line ∈ 1..=len; Insert-after needs line ∈ 0..=len.
+    let mut bad: Vec<usize> = edits
+        .iter()
+        .filter(|e| match e.kind {
+            EditKind::Replace | EditKind::Delete => e.line == 0 || e.line > lines.len(),
+            EditKind::Insert => e.line > lines.len(),
+        })
+        .map(|e| e.line)
+        .collect();
+    if !bad.is_empty() {
+        bad.sort_unstable();
+        bad.dedup();
+        return Err(bad);
+    }
+
+    // Apply high line number first so earlier indices stay valid as we mutate the vec.
+    let mut sorted: Vec<&&Edit> = edits.iter().collect();
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.line));
+    for e in sorted {
+        match e.kind {
+            EditKind::Replace => lines[e.line - 1].text = e.after.clone(),
+            EditKind::Delete => {
+                lines.remove(e.line - 1);
+            }
+            EditKind::Insert => {
+                let pos = e.line; // insert AFTER 1-indexed line `e.line` (0 = file top)
+                                  // Inserting after the final unterminated line: give that line the dominant
+                                  // terminator and make the new line the unterminated tail (preserve the shape).
+                let term = if pos == lines.len() && pos > 0 && lines[pos - 1].term.is_empty() {
+                    lines[pos - 1].term = dominant;
+                    ""
+                } else {
+                    dominant
+                };
+                lines.insert(
+                    pos,
+                    Line {
+                        text: e.after.clone(),
+                        term,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut out = String::with_capacity(text.len() + 64);
+    for l in &lines {
+        out.push_str(&l.text);
+        out.push_str(l.term);
+    }
+    Ok(out)
+}
+
 // ─────────────────────────────── diff rendering ───────────────────────────────
 
 impl MovePlan {
@@ -502,26 +612,17 @@ mod tests {
         let plan = plan_move(&ws, &mv);
 
         // mod b removed from a.rs
-        assert!(plan
-            .edits
-            .iter()
-            .any(|e| e.path == Path::new("src/a.rs")
-                && e.kind == EditKind::Delete
-                && e.before.contains("mod b")));
+        assert!(plan.edits.iter().any(|e| e.path == Path::new("src/a.rs")
+            && e.kind == EditKind::Delete
+            && e.before.contains("mod b")));
         // mod b added to util.rs
-        assert!(plan
-            .edits
-            .iter()
-            .any(|e| e.path == Path::new("src/util.rs")
-                && e.kind == EditKind::Insert
-                && e.after.contains("mod b")));
+        assert!(plan.edits.iter().any(|e| e.path == Path::new("src/util.rs")
+            && e.kind == EditKind::Insert
+            && e.after.contains("mod b")));
         // crate::a::b → crate::util::b in util.rs
-        assert!(plan
-            .edits
-            .iter()
-            .any(|e| e.path == Path::new("src/util.rs")
-                && e.kind == EditKind::Replace
-                && e.after.contains("crate::util::b::Widget")));
+        assert!(plan.edits.iter().any(|e| e.path == Path::new("src/util.rs")
+            && e.kind == EditKind::Replace
+            && e.after.contains("crate::util::b::Widget")));
     }
 
     #[test]
@@ -579,5 +680,74 @@ mod tests {
         );
         assert_eq!(mod_segments(Path::new("src/lib.rs")), Some(vec![]));
         assert_eq!(mod_segments(Path::new("src/main.rs")), Some(vec![]));
+    }
+
+    // ── byte-exact edit application ─────────────────────────────────────────────
+
+    fn ed(kind: EditKind, line: usize, after: &str) -> Edit {
+        Edit {
+            path: "f".into(),
+            line,
+            before: String::new(),
+            after: after.to_string(),
+            reason: String::new(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn apply_edits_preserves_crlf() {
+        // a Windows-authored file: every terminator is CRLF, no trailing newline on the last.
+        let text = "use crate::a::b;\r\nfn main() {}\r\nlet x = 1;";
+        let edits = [ed(EditKind::Replace, 1, "use crate::z::b;")];
+        let refs: Vec<&Edit> = edits.iter().collect();
+        let out = apply_edits(text, &refs).unwrap();
+        // line 1 rewritten; CRLF terminators intact; last line still unterminated
+        assert_eq!(out, "use crate::z::b;\r\nfn main() {}\r\nlet x = 1;");
+        assert!(!out.contains("\r\r"));
+    }
+
+    #[test]
+    fn apply_edits_preserves_no_trailing_newline() {
+        let text = "a\nb\nc"; // no final newline
+        let out = apply_edits(text, &[&ed(EditKind::Replace, 2, "B")]).unwrap();
+        assert_eq!(out, "a\nB\nc"); // still no trailing newline
+    }
+
+    #[test]
+    fn apply_edits_insert_after_unterminated_last_line() {
+        let text = "a\nb"; // "b" has no terminator
+                           // insert after line 2: "b" gains a \n, the new line becomes the unterminated tail
+        let out = apply_edits(text, &[&ed(EditKind::Insert, 2, "c")]).unwrap();
+        assert_eq!(out, "a\nb\nc");
+    }
+
+    #[test]
+    fn apply_edits_insert_at_top_and_delete() {
+        let text = "one\ntwo\n";
+        let edits = [ed(EditKind::Insert, 0, "zero"), ed(EditKind::Delete, 2, "")];
+        let refs: Vec<&Edit> = edits.iter().collect();
+        let out = apply_edits(text, &refs).unwrap();
+        assert_eq!(out, "zero\none\n");
+    }
+
+    #[test]
+    fn apply_edits_rejects_stale_out_of_range() {
+        let text = "a\nb\n"; // 2 lines
+        let err = apply_edits(text, &[&ed(EditKind::Replace, 9, "x")]).unwrap_err();
+        assert_eq!(err, vec![9]);
+        // an insert exactly at end (after last line) is valid, not stale
+        assert!(apply_edits(text, &[&ed(EditKind::Insert, 2, "c")]).is_ok());
+    }
+
+    #[test]
+    fn apply_edits_untouched_file_roundtrips_byte_exact() {
+        for text in ["", "a", "a\n", "a\r\nb\r\n", "x\ny\nz", "\n\n\n"] {
+            assert_eq!(
+                apply_edits(text, &[]).unwrap(),
+                text,
+                "roundtrip failed for {text:?}"
+            );
+        }
     }
 }
