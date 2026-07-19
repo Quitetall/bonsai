@@ -19,6 +19,7 @@ pub mod model;
 pub mod moves;
 pub mod scip;
 pub mod tree;
+pub mod walk;
 
 pub use config::{Config, NodeSpec};
 pub use lean::{analyze, LeanBaseline, LeanReport};

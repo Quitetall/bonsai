@@ -31,6 +31,9 @@ enum Cmd {
         /// Overwrite an existing bonsai.toml.
         #[arg(long)]
         force: bool,
+        /// Extra directory names to skip (repeatable) — vendored/scratch/sequestered trees.
+        #[arg(long = "skip")]
+        skip: Vec<String>,
     },
     /// Render the annotated capability tree from the model (loaded or auto-derived).
     Tree {
@@ -114,7 +117,7 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Init { root, force } => cmd_init(&root, force),
+        Cmd::Init { root, force, skip } => cmd_init(&root, force, &skip),
         Cmd::Tree { root, files, depth } => cmd_tree(&root, files, depth),
         Cmd::Stat { root, top } => cmd_stat(&root, top),
         Cmd::Diff { from, to, root } => cmd_move(&root, &from, &to, false),
@@ -444,7 +447,7 @@ fn load_or_derive(root: &Path) -> Result<Config> {
     }
 }
 
-fn cmd_init(root: &Path, force: bool) -> Result<()> {
+fn cmd_init(root: &Path, force: bool, skip: &[String]) -> Result<()> {
     let cfg_path = root.join("bonsai.toml");
     if cfg_path.exists() && !force {
         anyhow::bail!(
@@ -452,7 +455,7 @@ fn cmd_init(root: &Path, force: bool) -> Result<()> {
             cfg_path.display()
         );
     }
-    let cfg = Config::from_dir(root).context("deriving structure")?;
+    let cfg = Config::from_dir_with_skip(root, skip).context("deriving structure")?;
     let n = cfg.nodes.len();
     std::fs::write(&cfg_path, cfg.to_toml()?)
         .with_context(|| format!("writing {}", cfg_path.display()))?;
@@ -702,7 +705,7 @@ fn atom_loc(tree: &Tree, root: &Path) -> BTreeMap<NodeId, usize> {
             continue;
         }
         if let Some(anchor) = node.anchors.first() {
-            if let Ok(text) = std::fs::read_to_string(root.join(anchor)) {
+            if let Some(text) = bonsai::walk::read_text_capped(&root.join(anchor), 2_000_000) {
                 out.insert(node.id.clone(), text.lines().count());
             }
         }

@@ -124,7 +124,11 @@ pub fn analyze(tree: &Tree, root: &Path) -> LeanReport {
         let Some(anchor) = node.anchors.first() else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(root.join(anchor)) else {
+        let p = root.join(anchor);
+        if std::fs::metadata(&p).map(|m| m.len() > 2_000_000).unwrap_or(true) {
+            continue; // skip huge/unreadable (blobs aren't source dup candidates)
+        }
+        let Ok(bytes) = std::fs::read(&p) else {
             continue;
         };
         if bytes.is_empty() {
@@ -269,7 +273,9 @@ pub fn near_duplicates(tree: &Tree, root: &Path, threshold: f64) -> Vec<NearDup>
             continue;
         }
         let Some(anchor) = node.anchors.first() else { continue };
-        let Ok(text) = std::fs::read_to_string(root.join(anchor)) else { continue };
+        let Some(text) = crate::walk::read_text_capped(&root.join(anchor), 2_000_000) else {
+            continue;
+        };
         let mut set = BTreeSet::new();
         for line in text.lines() {
             let t = line.trim();

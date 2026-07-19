@@ -104,18 +104,7 @@ fn default_version() -> u32 {
     1
 }
 fn default_skip() -> Vec<String> {
-    [
-        "target",
-        ".git",
-        "node_modules",
-        "__pycache__",
-        ".venv",
-        "_dist",
-        "graphify-out",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+    crate::walk::DEFAULT_SKIP.iter().map(|s| s.to_string()).collect()
 }
 
 impl NodeSpec {
@@ -149,23 +138,25 @@ impl Config {
     /// nodes — they are overlaid live at render time (keeps `bonsai.toml` about *structure*,
     /// not an inventory that rots). Facets (`plane`, `language`) are guessed.
     pub fn from_dir(root: impl AsRef<Path>) -> anyhow::Result<Self> {
-        use walkdir::WalkDir;
-        let meta = Meta::default();
+        Self::from_dir_with_skip(root, &[])
+    }
+
+    /// Like [`from_dir`](Self::from_dir) but adds `extra_skip` directory names to the default
+    /// skip set (e.g. vendored/sequestered/scratch trees when adopting on a real repo).
+    pub fn from_dir_with_skip(root: impl AsRef<Path>, extra_skip: &[String]) -> anyhow::Result<Self> {
+        let mut meta = Meta::default();
+        for s in extra_skip {
+            if !meta.skip.contains(s) {
+                meta.skip.push(s.clone());
+            }
+        }
         let root = root.as_ref();
         let mut nodes = Vec::new();
-        for entry in WalkDir::new(root)
-            .min_depth(1)
-            .into_iter()
-            .filter_entry(|e| !is_skipped(e.file_name().to_str().unwrap_or(""), &meta.skip))
-            .filter_map(|e| e.ok())
-        {
-            if !entry.file_type().is_dir() {
+        for entry in crate::walk::walk(root, extra_skip) {
+            if !entry.is_dir {
                 continue;
             }
-            let rel = match entry.path().strip_prefix(root) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
+            let rel = &entry.rel;
             if let Some(depth) = meta.max_init_depth {
                 if rel.components().count() > depth {
                     continue;
@@ -179,7 +170,7 @@ impl Config {
                 .unwrap_or_else(|| meta.root.clone());
             let mut facets = BTreeMap::new();
             facets.insert("plane".into(), plane_of(rel).into());
-            if let Some(lang) = dominant_language(entry.path()) {
+            if let Some(lang) = dominant_language(&root.join(rel)) {
                 facets.insert("language".into(), lang.into());
             }
             nodes.push(NodeSpec {
@@ -241,20 +232,11 @@ impl Config {
 
 /// Overlay live files as atom nodes beneath their nearest existing directory node.
 fn overlay_files(nodes: &mut BTreeMap<NodeId, Node>, root_id: &str, dir: &Path, skip: &[String]) {
-    use walkdir::WalkDir;
-    for entry in WalkDir::new(dir)
-        .min_depth(1)
-        .into_iter()
-        .filter_entry(|e| !is_skipped(e.file_name().to_str().unwrap_or(""), skip))
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
+    for entry in crate::walk::walk(dir, skip) {
+        if entry.is_dir {
             continue;
         }
-        let rel = match entry.path().strip_prefix(dir) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+        let rel = &entry.rel;
         let id = rel_id(rel);
         if nodes.contains_key(&id) {
             continue; // an explicit override already placed this file
@@ -307,9 +289,6 @@ fn wire_children(nodes: &mut BTreeMap<NodeId, Node>) {
     }
 }
 
-fn is_skipped(name: &str, skip: &[String]) -> bool {
-    skip.iter().any(|s| s == name)
-}
 
 /// A repo-relative path → node id (forward-slashed, extension kept — paths are natural ids).
 fn rel_id(rel: &Path) -> String {

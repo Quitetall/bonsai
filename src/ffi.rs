@@ -13,7 +13,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportKind {
@@ -63,21 +62,12 @@ pub struct FfiGraph {
 /// Scan a repo for the FFI boundary. Reads `.rs` (PyO3 exports) + `.py` (imports), then
 /// stitches them at the `#[pymodule]` name.
 pub fn scan(root: &Path) -> FfiGraph {
-    const SKIP: &[&str] = &["target", ".git", "node_modules", "__pycache__", ".venv"];
     let mut g = FfiGraph::default();
     let mut module_file: BTreeMap<String, String> = BTreeMap::new();
 
-    for entry in WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| !e.file_name().to_str().map(|s| SKIP.contains(&s)).unwrap_or(false))
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+    for rel in crate::walk::files_with_ext(root, &[], &["rs", "py"]) {
         let relstr = rel.to_string_lossy().to_string();
-        let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
+        let Ok(text) = std::fs::read_to_string(root.join(&rel)) else { continue };
         match rel.extension().and_then(|e| e.to_str()) {
             Some("rs") => scan_rust(&text, &relstr, &mut g.exports, &mut module_file),
             Some("py") => scan_python(&text, &relstr, &mut g.imports),

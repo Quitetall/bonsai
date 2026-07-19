@@ -77,31 +77,14 @@ impl Workspace {
         }
     }
 
-    /// Build from disk: every `.rs` file under `root`, skipping VCS/build dirs. Paths are
-    /// stored repo-relative so plans and diffs are location-independent.
+    /// Build from disk: every `.rs` file under `root` (respecting `.gitignore` via the shared
+    /// walk policy). Paths are stored repo-relative so plans and diffs are location-independent.
     pub fn from_dir(root: impl AsRef<Path>) -> std::io::Result<Self> {
-        use walkdir::WalkDir;
-        const SKIP: &[&str] = &["target", ".git", "node_modules", "__pycache__", ".venv"];
         let root = root.as_ref().to_path_buf();
         let mut files = BTreeMap::new();
-        for entry in WalkDir::new(&root)
-            .into_iter()
-            .filter_entry(|e| {
-                !e.file_name()
-                    .to_str()
-                    .map(|s| SKIP.contains(&s))
-                    .unwrap_or(false)
-            })
-            .filter_map(|e| e.ok())
-        {
-            if entry.file_type().is_file()
-                && entry.path().extension().and_then(|e| e.to_str()) == Some("rs")
-            {
-                if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                    if let Ok(rel) = entry.path().strip_prefix(&root) {
-                        files.insert(rel.to_path_buf(), text);
-                    }
-                }
+        for rel in crate::walk::files_with_ext(&root, &[], &["rs"]) {
+            if let Ok(text) = std::fs::read_to_string(root.join(&rel)) {
+                files.insert(rel, text);
             }
         }
         Ok(Workspace { root, files })
