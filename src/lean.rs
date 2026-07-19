@@ -39,8 +39,11 @@ pub struct LeanReport {
     pub composites: usize,
     /// Composite nodes with zero descendant files (dead structure).
     pub empty_dirs: Vec<String>,
-    /// Exact-duplicate content groups (non-empty files only).
+    /// Exact-duplicate content groups (non-empty files only) — *within a single sub-repo*.
     pub dup_groups: Vec<DupGroup>,
+    /// Identical files mirrored *across* sub-repo boundaries (e.g. a per-submodule LICENSE).
+    /// Informational — NOT counted as waste, because separate repos legitimately carry copies.
+    pub cross_repo_mirrors: usize,
     pub max_depth: usize,
     /// Dead internal symbols (unreachable from the public API) — `Some` only when a SCIP
     /// index is present; `None` = unmeasured (never faked as 0).
@@ -115,8 +118,11 @@ pub fn analyze(tree: &Tree, root: &Path) -> LeanReport {
     report.empty_dirs.sort();
     report.max_depth = depth_of(tree);
 
-    // exact-duplicate content groups (skip empty files — trivially identical, pure noise)
-    let mut by_hash: BTreeMap<u64, Vec<(String, usize)>> = BTreeMap::new();
+    // exact-duplicate content groups (skip empty files — trivially identical, pure noise).
+    // Group by content hash; a group that spans multiple sub-repos is a cross-repo *mirror*
+    // (informational), while duplicates *within one sub-repo* are the real waste.
+    let subrepos = crate::walk::subrepo_roots(root, &[]);
+    let mut by_hash: BTreeMap<u64, Vec<(String, usize, String)>> = BTreeMap::new();
     for node in tree.nodes.values() {
         if node.kind != Kind::Atom {
             continue;
@@ -137,19 +143,29 @@ pub fn analyze(tree: &Tree, root: &Path) -> LeanReport {
         let mut h = DefaultHasher::new();
         bytes.hash(&mut h);
         let loc = bytes.iter().filter(|b| **b == b'\n').count() + 1;
-        by_hash
-            .entry(h.finish())
-            .or_default()
-            .push((node.id.clone(), loc));
+        let sub = crate::walk::subrepo_of(std::path::Path::new(anchor), &subrepos)
+            .to_string_lossy()
+            .to_string();
+        by_hash.entry(h.finish()).or_default().push((node.id.clone(), loc, sub));
     }
-    for (_, mut group) in by_hash {
-        if group.len() > 1 {
-            group.sort();
-            let loc = group[0].1;
-            report.dup_groups.push(DupGroup {
-                files: group.into_iter().map(|(id, _)| id).collect(),
-                loc,
-            });
+    for (_, group) in by_hash {
+        // partition the identical-content group by sub-repo
+        let mut by_sub: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
+        for (id, loc, sub) in group {
+            by_sub.entry(sub).or_default().push((id, loc));
+        }
+        if by_sub.len() > 1 {
+            report.cross_repo_mirrors += 1; // legitimate copy across repos — not counted
+        }
+        for (_sub, mut group) in by_sub {
+            if group.len() > 1 {
+                group.sort();
+                let loc = group[0].1;
+                report.dup_groups.push(DupGroup {
+                    files: group.into_iter().map(|(id, _)| id).collect(),
+                    loc,
+                });
+            }
         }
     }
     report
@@ -265,9 +281,12 @@ pub fn near_duplicates(tree: &Tree, root: &Path, threshold: f64) -> Vec<NearDup>
     const MAX_DF: usize = 40; // a line in >40 files is boilerplate → skip
     const MIN_SHARED: usize = 5; // candidate pairs must share ≥5 non-trivial lines
 
-    // per-file normalized line-hash set
+    // per-file normalized line-hash set + its sub-repo (so cross-repo pairs are excluded —
+    // a spec mirrored into a submodule is not a near-dup to smash)
+    let subrepos = crate::walk::subrepo_roots(root, &[]);
     let mut paths: Vec<String> = Vec::new();
     let mut sets: Vec<BTreeSet<u64>> = Vec::new();
+    let mut file_sub: Vec<String> = Vec::new();
     for node in tree.nodes.values() {
         if node.kind != Kind::Atom {
             continue;
@@ -289,6 +308,11 @@ pub fn near_duplicates(tree: &Tree, root: &Path, threshold: f64) -> Vec<NearDup>
         if set.len() >= MIN_LINES {
             paths.push(anchor.clone());
             sets.push(set);
+            file_sub.push(
+                crate::walk::subrepo_of(std::path::Path::new(anchor), &subrepos)
+                    .to_string_lossy()
+                    .to_string(),
+            );
         }
     }
 
@@ -316,6 +340,9 @@ pub fn near_duplicates(tree: &Tree, root: &Path, threshold: f64) -> Vec<NearDup>
     for ((i, j), n) in shared {
         if n < MIN_SHARED {
             continue;
+        }
+        if file_sub[i] != file_sub[j] {
+            continue; // cross-sub-repo copies are legitimate, not near-dup cruft
         }
         let (si, sj) = (&sets[i], &sets[j]);
         let inter = si.intersection(sj).count();

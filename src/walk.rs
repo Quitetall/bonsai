@@ -28,7 +28,14 @@ pub fn walk(root: &Path, extra_skip: &[String]) -> Vec<Entry> {
         .collect();
 
     let mut wb = WalkBuilder::new(root);
-    wb.hidden(true).git_ignore(true).git_exclude(true).parents(true).sort_by_file_name(Ord::cmp);
+    // require_git(false): honor `.gitignore` even when the target isn't itself a git repo
+    // (a general structure tool should respect ignore rules everywhere, not only in-repo).
+    wb.hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .require_git(false)
+        .parents(true)
+        .sort_by_file_name(Ord::cmp);
     wb.filter_entry(move |e| e.file_name().to_str().map(|n| !skip.contains(n)).unwrap_or(true));
 
     let mut out = Vec::new();
@@ -44,6 +51,30 @@ pub fn walk(root: &Path, extra_skip: &[String]) -> Vec<Entry> {
     out
 }
 
+/// Detect **sub-repo boundaries** — directories that are their own git repository
+/// (a nested repo has a `.git/` dir; a submodule has a `.git` *file* gitlink). Returned as
+/// repo-relative dir paths. This is what lets Bonsai avoid the classic false positive of
+/// flagging a per-submodule `LICENSE` (or mirrored spec/test) as duplication: two files in
+/// *different* sub-repos are legitimately separate, not cruft.
+pub fn subrepo_roots(root: &Path, extra_skip: &[String]) -> Vec<PathBuf> {
+    walk(root, extra_skip)
+        .into_iter()
+        .filter(|e| e.is_dir && root.join(&e.rel).join(".git").exists())
+        .map(|e| e.rel)
+        .collect()
+}
+
+/// The deepest sub-repo containing `rel` (empty path = the top repo). `roots` from
+/// [`subrepo_roots`]; the top repo is always the implicit fallback.
+pub fn subrepo_of<'a>(rel: &Path, roots: &'a [PathBuf]) -> &'a Path {
+    roots
+        .iter()
+        .filter(|r| rel.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        .map(|r| r.as_path())
+        .unwrap_or_else(|| Path::new(""))
+}
+
 /// Read a file to a string only if it is under `max_bytes` (guards against a tracked but
 /// huge data/blob file slipping past `.gitignore` and stalling a scan). `None` if too big
 /// or unreadable.
@@ -53,6 +84,24 @@ pub fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
         return None;
     }
     std::fs::read_to_string(path).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subrepo_of_picks_deepest() {
+        let roots = vec![
+            PathBuf::from("sub"),
+            PathBuf::from("sub/nested"),
+            PathBuf::from("other"),
+        ];
+        assert_eq!(subrepo_of(Path::new("sub/nested/a.rs"), &roots), Path::new("sub/nested"));
+        assert_eq!(subrepo_of(Path::new("sub/a.rs"), &roots), Path::new("sub"));
+        assert_eq!(subrepo_of(Path::new("top.rs"), &roots), Path::new("")); // top repo
+        assert_eq!(subrepo_of(Path::new("other/x.rs"), &roots), Path::new("other"));
+    }
 }
 
 /// Files only, filtered to the given extensions (lowercase, no dot). Empty `exts` = all files.

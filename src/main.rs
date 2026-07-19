@@ -359,6 +359,12 @@ fn cmd_lean(root: &Path, save: bool) -> Result<()> {
         r.wasted_loc()
     );
     let near = bonsai::lean::near_duplicates(&tree, root, 0.85);
+    if r.cross_repo_mirrors > 0 {
+        println!(
+            "  cross-repo mirrors: {} (identical across sub-repos — NOT counted as waste)",
+            r.cross_repo_mirrors
+        );
+    }
     println!("  near-duplicates: {} pair(s) (≥0.85 similar, not identical)", near.len());
     for nd in near.iter().take(8) {
         println!("    {:.0}%  {}  ~  {}", nd.similarity * 100.0, nd.a, nd.b);
