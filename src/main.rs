@@ -4,12 +4,24 @@
 
 use anyhow::{Context, Result};
 use bonsai::config::Config;
+use bonsai::finding::{Finding, Location, Report, Severity};
 use bonsai::model::{Kind, NodeId, Plane};
 use bonsai::moves::{plan_move, Edit, Move, MovePlan, Workspace};
 use bonsai::tree::Tree;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Output format for the finding stream (`lean`/`check`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Format {
+    /// The rich, human-readable per-command report (default).
+    Text,
+    /// A flat JSON list of findings.
+    Json,
+    /// SARIF 2.1.0 for CI code scanning.
+    Sarif,
+}
 
 #[derive(Parser)]
 #[command(
@@ -81,6 +93,9 @@ enum Cmd {
         /// Disable the incremental scan cache (.bonsai/scan-cache.json).
         #[arg(long)]
         no_cache: bool,
+        /// Output format: text (default), json, or sarif (CI code scanning).
+        #[arg(long, value_enum, default_value = "text")]
+        format: Format,
     },
     /// Fail-closed gate: tree invariants + leanness ratchet (CI / pre-commit).
     Check {
@@ -89,6 +104,9 @@ enum Cmd {
         /// Disable the incremental scan cache (.bonsai/scan-cache.json).
         #[arg(long)]
         no_cache: bool,
+        /// Output format: text (default), json, or sarif (CI code scanning).
+        #[arg(long, value_enum, default_value = "text")]
+        format: Format,
     },
     /// Docs plane: run the recursive compose executor (byte-identity gate + recursion).
     Docs {
@@ -137,8 +155,13 @@ fn main() -> Result<()> {
             root,
             save,
             no_cache,
-        } => cmd_lean(&root, save, !no_cache),
-        Cmd::Check { root, no_cache } => cmd_check(&root, !no_cache),
+            format,
+        } => cmd_lean(&root, save, !no_cache, format),
+        Cmd::Check {
+            root,
+            no_cache,
+            format,
+        } => cmd_check(&root, !no_cache, format),
         Cmd::Docs { root } => cmd_docs(&root),
         Cmd::Index {
             root,
@@ -357,7 +380,103 @@ fn cmd_docs(root: &Path) -> Result<()> {
 
 const LEAN_BASELINE: &str = "bonsai.lean.json";
 
-fn cmd_lean(root: &Path, save: bool, cache: bool) -> Result<()> {
+/// Load the SCIP code graph at `<root>/index.scip` if present (for dead-code + misplacement
+/// findings); `None` when no index exists — those signals stay unmeasured, never faked.
+fn load_graph_opt(root: &Path) -> Option<bonsai::scip::CodeGraph> {
+    let scip = root.join("index.scip");
+    scip.exists()
+        .then(|| bonsai::scip::CodeGraph::from_file(&scip).ok())
+        .flatten()
+}
+
+/// Turn a leanness report (+ near-dups + optional code graph) into the uniform finding stream.
+/// This is the single mapping from Bonsai's signals to typed [`Finding`]s for JSON/SARIF.
+fn lean_findings(
+    root: &Path,
+    r: &bonsai::lean::LeanReport,
+    near: &[bonsai::lean::NearDup],
+    graph: Option<&bonsai::scip::CodeGraph>,
+) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for g in &r.dup_groups {
+        let related = g.files[1..].iter().map(Location::file).collect();
+        out.push(
+            Finding::new(
+                "duplicate",
+                Severity::Warning,
+                format!(
+                    "{} byte-identical copies ({} lines each)",
+                    g.files.len(),
+                    g.loc
+                ),
+                Location::file(g.files[0].clone()),
+            )
+            .with_related(related)
+            .with_fix("keep one copy; replace the rest with a reference/import"),
+        );
+    }
+    for nd in near {
+        out.push(
+            Finding::new(
+                "near-duplicate",
+                Severity::Info,
+                format!("{:.0}% similar to {}", nd.similarity * 100.0, nd.b),
+                Location::file(nd.a.clone()),
+            )
+            .with_related(vec![Location::file(nd.b.clone())])
+            .with_fix("reconcile the copies or extract the shared part"),
+        );
+    }
+    for d in &r.empty_dirs {
+        out.push(
+            Finding::new(
+                "empty-dir",
+                Severity::Info,
+                "empty directory (no tracked files)",
+                Location::file(d.clone()),
+            )
+            .with_fix("remove, or populate"),
+        );
+    }
+    if let Some(g) = graph {
+        for s in g.dead_symbols(root, &[]) {
+            let name = if s.display.is_empty() {
+                "<symbol>"
+            } else {
+                &s.display
+            };
+            out.push(
+                Finding::new(
+                    "dead-code",
+                    Severity::Warning,
+                    format!("`{name}` unreachable from pub API / main / tests"),
+                    Location::at(s.file.clone(), (s.def.sl + 1).max(1) as u32),
+                )
+                .with_fix("sequester (dead code is moved to deprecated/, never deleted)"),
+            );
+        }
+        for m in g.misplacements() {
+            out.push(
+                Finding::new(
+                    "misplaced",
+                    Severity::Info,
+                    format!(
+                        "used only from {}/ ({} dependents)",
+                        m.suggested_dir, m.dependents
+                    ),
+                    Location::file(m.file.clone()),
+                )
+                .with_fix(format!(
+                    "bonsai tidy --write → reference-safe move into {}/",
+                    m.suggested_dir
+                )),
+            );
+        }
+    }
+    out
+}
+
+fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
     // one parallel content pass feeds both the exact-dup report and near-duplicates.
@@ -369,78 +488,86 @@ fn cmd_lean(root: &Path, save: bool, cache: bool) -> Result<()> {
     }
     let scan = bonsai::scan::Scan::run(root, &scfg);
     let mut r = bonsai::lean::analyze_from_scan(&tree, &scan);
+    let near = bonsai::lean::near_duplicates_from_scan(&scan, 0.85);
     // measure SCIP-backed signals if an index is present (moves them out of "deferred")
-    r.dead_code = bonsai::lean::dead_code_count(root);
-    r.misplaced = bonsai::lean::misplacement_count(root);
-    if r.dead_code.is_some() {
-        r.deferred.retain(|d| !d.starts_with("dead-code"));
-    }
-    if r.misplaced.is_some() {
-        r.deferred.retain(|d| !d.starts_with("misplacement"));
+    let graph = load_graph_opt(root);
+    if let Some(g) = &graph {
+        r.dead_code = Some(g.dead_symbols(root, &[]).len());
+        r.misplaced = Some(g.misplacements().len());
+        r.deferred
+            .retain(|d| !d.starts_with("dead-code") && !d.starts_with("misplacement"));
     }
 
-    println!(
-        "bonsai lean — {} files, {} composites, depth {}",
-        r.files, r.composites, r.max_depth
-    );
-    if scan.cache_hits > 0 || scan.over_cap > 0 || scan.unreadable > 0 {
-        println!(
-            "  scan           : {} cache hit(s), {} over-cap, {} unreadable",
-            scan.cache_hits, scan.over_cap, scan.unreadable
-        );
-    }
-    if let Some(n) = r.dead_code {
-        println!("  dead symbols   : {n}  (SCIP-measured)");
-    }
-    if let Some(n) = r.misplaced {
-        println!("  misplaced files: {n}  (SCIP-measured)");
-    }
-    println!(
-        "  leanness score : {:.4}  (1.0 = no measured waste)",
-        r.score()
-    );
-    println!(
-        "  duplicate files: {} across {} group(s), {} redundant LOC",
-        r.dup_files(),
-        r.dup_groups.len(),
-        r.wasted_loc()
-    );
-    let near = bonsai::lean::near_duplicates_from_scan(&scan, 0.85);
-    if r.cross_repo_mirrors > 0 {
-        println!(
-            "  cross-repo mirrors: {} (identical across sub-repos — NOT counted as waste)",
-            r.cross_repo_mirrors
-        );
-    }
-    println!(
-        "  near-duplicates: {} pair(s) (≥0.85 similar, not identical)",
-        near.len()
-    );
-    for nd in near.iter().take(8) {
-        println!("    {:.0}%  {}  ~  {}", nd.similarity * 100.0, nd.a, nd.b);
-    }
-    println!("  empty dirs     : {}", r.empty_dirs.len());
-    for g in r.dup_groups.iter().take(12) {
-        println!("    ×{}  {}", g.files.len(), g.files.join("  ≡  "));
-    }
-    if !r.empty_dirs.is_empty() {
-        println!(
-            "  empty: {}{}",
-            r.empty_dirs
-                .iter()
-                .take(8)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-            if r.empty_dirs.len() > 8 { " …" } else { "" }
-        );
-    }
-    if r.deferred.is_empty() {
-        println!("  deferred       : none — every signal measured");
+    if format != Format::Text {
+        let report = Report::new(lean_findings(root, &r, &near, graph.as_ref()));
+        match format {
+            Format::Json => println!("{}", report.to_json()),
+            Format::Sarif => println!("{}", report.to_sarif()),
+            Format::Text => unreachable!(),
+        }
     } else {
-        println!("  deferred (unmeasured — never faked as 0):");
-        for d in &r.deferred {
-            println!("    · {d}");
+        println!(
+            "bonsai lean — {} files, {} composites, depth {}",
+            r.files, r.composites, r.max_depth
+        );
+        if scan.cache_hits > 0 || scan.over_cap > 0 || scan.unreadable > 0 {
+            println!(
+                "  scan           : {} cache hit(s), {} over-cap, {} unreadable",
+                scan.cache_hits, scan.over_cap, scan.unreadable
+            );
+        }
+        if let Some(n) = r.dead_code {
+            println!("  dead symbols   : {n}  (SCIP-measured)");
+        }
+        if let Some(n) = r.misplaced {
+            println!("  misplaced files: {n}  (SCIP-measured)");
+        }
+        println!(
+            "  leanness score : {:.4}  (1.0 = no measured waste)",
+            r.score()
+        );
+        println!(
+            "  duplicate files: {} across {} group(s), {} redundant LOC",
+            r.dup_files(),
+            r.dup_groups.len(),
+            r.wasted_loc()
+        );
+        if r.cross_repo_mirrors > 0 {
+            println!(
+                "  cross-repo mirrors: {} (identical across sub-repos — NOT counted as waste)",
+                r.cross_repo_mirrors
+            );
+        }
+        println!(
+            "  near-duplicates: {} pair(s) (≥0.85 similar, not identical)",
+            near.len()
+        );
+        for nd in near.iter().take(8) {
+            println!("    {:.0}%  {}  ~  {}", nd.similarity * 100.0, nd.a, nd.b);
+        }
+        println!("  empty dirs     : {}", r.empty_dirs.len());
+        for g in r.dup_groups.iter().take(12) {
+            println!("    ×{}  {}", g.files.len(), g.files.join("  ≡  "));
+        }
+        if !r.empty_dirs.is_empty() {
+            println!(
+                "  empty: {}{}",
+                r.empty_dirs
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if r.empty_dirs.len() > 8 { " …" } else { "" }
+            );
+        }
+        if r.deferred.is_empty() {
+            println!("  deferred       : none — every signal measured");
+        } else {
+            println!("  deferred (unmeasured — never faked as 0):");
+            for d in &r.deferred {
+                println!("    · {d}");
+            }
         }
     }
 
@@ -456,10 +583,15 @@ fn cmd_lean(root: &Path, save: bool, cache: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_check(root: &Path, cache: bool) -> Result<()> {
+fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
-    let mut errs = tree.check();
+    // (rule, message) per violation: tree invariants first, then ratchet regressions.
+    let mut violations: Vec<(&'static str, String)> = tree
+        .check()
+        .into_iter()
+        .map(|e| ("tree-invariant", e))
+        .collect();
 
     // leanness ratchet: only enforced if a baseline is committed (opt-in per repo)
     let baseline_path = root.join(LEAN_BASELINE);
@@ -477,21 +609,47 @@ fn cmd_check(root: &Path, cache: bool) -> Result<()> {
         report.dead_code = bonsai::lean::dead_code_count(root);
         report.misplaced = bonsai::lean::misplacement_count(root);
         for reg in baseline.regressions(&report) {
-            errs.push(format!("leanness ratchet: {reg}"));
+            violations.push(("leanness-ratchet", reg));
         }
     }
 
-    if errs.is_empty() {
+    // Machine formats: emit the violations as an error-severity finding stream, then fail
+    // closed if any exist (CI gets both a SARIF report and a non-zero exit).
+    if format != Format::Text {
+        let findings = violations
+            .iter()
+            .map(|(rule, msg)| {
+                Finding::new(
+                    rule,
+                    Severity::Error,
+                    msg.clone(),
+                    Location::file(LEAN_BASELINE),
+                )
+            })
+            .collect();
+        let report = Report::new(findings);
+        match format {
+            Format::Json => println!("{}", report.to_json()),
+            Format::Sarif => println!("{}", report.to_sarif()),
+            Format::Text => unreachable!(),
+        }
+        if report.has_errors() {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if violations.is_empty() {
         println!(
             "bonsai check: OK — {} nodes, invariants + ratchet hold",
             tree.nodes.len()
         );
         Ok(())
     } else {
-        for e in &errs {
-            println!("  ✗ {e}");
+        for (rule, msg) in &violations {
+            println!("  ✗ [{rule}] {msg}");
         }
-        anyhow::bail!("bonsai check: {} violation(s)", errs.len());
+        anyhow::bail!("bonsai check: {} violation(s)", violations.len());
     }
 }
 

@@ -15,6 +15,7 @@
 pub mod cache;
 pub mod config;
 pub mod ffi;
+pub mod finding;
 pub mod lean;
 pub mod model;
 pub mod moves;
@@ -24,6 +25,7 @@ pub mod tree;
 pub mod walk;
 
 pub use config::{Config, NodeSpec};
+pub use finding::{Finding, Location, Report, Severity};
 pub use lean::{analyze, LeanBaseline, LeanReport};
 pub use model::{Kind, Node, NodeId, Plane};
 pub use moves::{Move, MovePlan, ReferenceResolver, RustModuleResolver, Workspace};
