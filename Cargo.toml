@@ -3,10 +3,13 @@
 # workspace and extraction-ready (Bonsai graduates to its own repo).
 [package]
 name = "bonsai"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
-description = "One recursive atom/parent engine for code structure and documentation (ADR 0134)"
+description = "A recursive atom/parent structure engine: parallel dedup, dead-code, reference-safe moves, and a fail-closed leanness gate for any repo — laptop to monorepo."
 license = "AGPL-3.0-or-later"
+repository = "https://github.com/QuiteTall/bonsai"
+keywords = ["refactoring", "duplication", "dead-code", "sarif", "monorepo"]
+categories = ["development-tools", "command-line-utilities"]
 
 [[bin]]
 name = "bonsai"

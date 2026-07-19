@@ -1,7 +1,5 @@
 {
   "min_score": 1.0,
   "max_dup_files": 0,
-  "max_empty_dirs": 0,
-  "max_dead": 0,
-  "max_misplaced": 0
+  "max_empty_dirs": 0
 }
