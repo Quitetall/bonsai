@@ -12,6 +12,7 @@
 //! - **Dependency** — an acyclic DAG (`depends_on`), levelized toward stable nodes.
 //! - **Facets** — cross-cutting axes (plane, layer, repo, diataxis, …), not branches.
 
+pub mod cache;
 pub mod config;
 pub mod ffi;
 pub mod lean;

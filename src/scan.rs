@@ -14,6 +14,7 @@
 //! text is dropped after the pass — nothing is held resident across the whole tree, which is
 //! what lets the same code run on a laptop repo and a monorepo.
 
+use crate::cache::{self, Cache, CacheEntry};
 use crate::walk::{self};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,11 @@ pub struct ScanConfig {
     /// Compute the per-file normalized-line shingle set (near-dup needs it; the fast gate
     /// does not — skipping it keeps `check` cheap).
     pub want_shingles: bool,
+    /// Path to an incremental scan cache (`.bonsai/scan-cache.json`). When set, unchanged
+    /// files (matching `(size, mtime)`) reuse their stored hash/line-count instead of being
+    /// re-read; the refreshed cache is written back after the pass. `None` = no caching.
+    /// Caching is skipped when `want_shingles` is set (shingles need a read regardless).
+    pub cache_path: Option<PathBuf>,
 }
 
 impl Default for ScanConfig {
@@ -43,6 +49,7 @@ impl Default for ScanConfig {
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             extra_skip: Vec::new(),
             want_shingles: false,
+            cache_path: None,
         }
     }
 }
@@ -62,6 +69,15 @@ impl ScanConfig {
     pub fn skipping(mut self, extra: &[String]) -> Self {
         self.extra_skip = extra.to_vec();
         self
+    }
+    /// Enable the incremental cache at `path`.
+    pub fn with_cache(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cache_path = Some(path.into());
+        self
+    }
+    /// The conventional cache location under a repo root.
+    pub fn default_cache_path(root: &Path) -> PathBuf {
+        root.join(".bonsai").join("scan-cache.json")
     }
 }
 
@@ -110,6 +126,8 @@ pub struct Scan {
     pub over_cap: usize,
     /// Files that failed to read (permissions, races, vanished mid-scan).
     pub unreadable: usize,
+    /// Files served from the incremental cache without a read (0 if caching was off).
+    pub cache_hits: usize,
 }
 
 impl Scan {
@@ -125,10 +143,21 @@ impl Scan {
             .map(|e| e.rel)
             .collect();
 
-        let facts: Vec<FileFacts> = rels
+        // The incremental cache accelerates the gate path only (shingles always need a read).
+        let use_cache = cfg.cache_path.is_some() && !cfg.want_shingles;
+        let old = match &cfg.cache_path {
+            Some(p) if use_cache => Cache::load(p),
+            _ => Cache::default(),
+        };
+
+        // (facts, was_cache_hit) per file, in walk order.
+        let scored: Vec<(FileFacts, bool)> = rels
             .par_iter()
-            .map(|rel| read_facts(root, rel, &subrepos, cfg))
+            .map(|rel| read_facts(root, rel, &subrepos, cfg, use_cache.then_some(&old)))
             .collect();
+
+        let cache_hits = scored.iter().filter(|(_, hit)| *hit).count();
+        let facts: Vec<FileFacts> = scored.into_iter().map(|(f, _)| f).collect();
 
         let over_cap = facts
             .iter()
@@ -139,12 +168,19 @@ impl Scan {
             .filter(|f| f.hash.is_none() && f.size <= cfg.max_file_bytes && f.size > 0)
             .count();
 
+        // Refresh + persist the cache from this pass (both gate and shingle runs produce
+        // hashes/line-counts, so a `lean` run also warms the cache for the next `check`).
+        if let Some(p) = &cfg.cache_path {
+            write_cache(p, root, &facts);
+        }
+
         Scan {
             root: root.to_path_buf(),
             files: facts,
             subrepos,
             over_cap,
             unreadable,
+            cache_hits,
         }
     }
 
@@ -154,12 +190,20 @@ impl Scan {
     }
 }
 
-/// Read and characterize one file. Never panics: a stat or read failure yields a
-/// zeroed-hash fact (counted as unreadable) rather than aborting the whole scan.
-fn read_facts(root: &Path, rel: &Path, subrepos: &[PathBuf], cfg: &ScanConfig) -> FileFacts {
+/// Read and characterize one file, consulting `cache` first. Never panics: a stat or read
+/// failure yields a zeroed-hash fact (counted as unreadable) rather than aborting the scan.
+/// Returns `(facts, cache_hit)`.
+fn read_facts(
+    root: &Path,
+    rel: &Path,
+    subrepos: &[PathBuf],
+    cfg: &ScanConfig,
+    cache: Option<&Cache>,
+) -> (FileFacts, bool) {
     let subrepo = walk::subrepo_of(rel, subrepos).to_path_buf();
     let abs = root.join(rel);
-    let size = std::fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+    let fp = cache::stat_fingerprint(&abs);
+    let size = fp.map(|(s, _)| s).unwrap_or(0);
 
     let mut facts = FileFacts {
         rel: rel.to_path_buf(),
@@ -171,14 +215,26 @@ fn read_facts(root: &Path, rel: &Path, subrepos: &[PathBuf], cfg: &ScanConfig) -
         shingles: Vec::new(),
     };
 
+    // Cache hit: reuse the stored fingerprint without reading the file.
+    if let (Some(cache), Some((size, mtime))) = (cache, fp) {
+        if let Some(e) = cache.entries.get(&facts.rel_str()) {
+            if e.matches(size, mtime) {
+                facts.is_binary = e.is_binary;
+                facts.lines = e.lines;
+                facts.hash = e.hash.as_deref().and_then(cache::hex_to_hash);
+                return (facts, true);
+            }
+        }
+    }
+
     if size == 0 || size > cfg.max_file_bytes {
-        return facts; // empty (never a dup) or over cap (not a source candidate)
+        return (facts, false); // empty (never a dup) or over cap (not a source candidate)
     }
     let Ok(bytes) = std::fs::read(&abs) else {
-        return facts; // unreadable — counted, not fatal
+        return (facts, false); // unreadable — counted, not fatal
     };
     if bytes.is_empty() {
-        return facts;
+        return (facts, false);
     }
 
     facts.is_binary = is_binary(&bytes);
@@ -191,7 +247,39 @@ fn read_facts(root: &Path, rel: &Path, subrepos: &[PathBuf], cfg: &ScanConfig) -
             facts.shingles = shingles(text);
         }
     }
-    facts
+    (facts, false)
+}
+
+/// Build a fresh cache from this pass's facts and write it atomically. Only files with a live
+/// stat fingerprint are stored (an unreadable file is left out so it's retried next run).
+fn write_cache(path: &Path, root: &Path, facts: &[FileFacts]) {
+    let mut cache = Cache {
+        version: cache::CACHE_VERSION,
+        entries: Default::default(),
+    };
+    for f in facts {
+        let Some((size, mtime)) = cache::stat_fingerprint(&root.join(&f.rel)) else {
+            continue;
+        };
+        // Only cache files we actually characterized (read or a prior hit). Skip over-cap/
+        // unreadable non-empty files so they are re-attempted, but DO cache empty files
+        // (hash=None, cheap) so they don't churn the cache.
+        if f.hash.is_none() && f.size > 0 {
+            continue;
+        }
+        cache.entries.insert(
+            f.rel_str(),
+            CacheEntry {
+                size,
+                mtime_s: mtime.0,
+                mtime_ns: mtime.1,
+                hash: f.hash.as_ref().map(cache::hash_to_hex),
+                lines: f.lines,
+                is_binary: f.is_binary,
+            },
+        );
+    }
+    cache.save(path);
 }
 
 /// git's binary test: a NUL byte in the head, or the whole content is not valid UTF-8.
@@ -289,6 +377,70 @@ mod tests {
         assert!(gate.files[0].shingles.is_empty(), "gate must not shingle");
         let full = Scan::run(&base, &ScanConfig::with_shingles());
         assert!(!full.files[0].shingles.is_empty(), "full scan must shingle");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn incremental_cache_reuses_unchanged_files() {
+        let base = probe("cache_hit");
+        fs::write(base.join("a.rs"), "fn a() {}\n").unwrap();
+        fs::write(base.join("b.rs"), "fn b() {}\n").unwrap();
+        let cache = base.join(".bonsai").join("scan-cache.json");
+        let cfg = ScanConfig::gate().with_cache(cache.clone());
+
+        // cold run: nothing cached yet → 0 hits, cache written
+        let cold = Scan::run(&base, &cfg);
+        assert_eq!(cold.cache_hits, 0);
+        assert!(cache.exists(), "cache file should be written");
+        let a_hash = cold
+            .files
+            .iter()
+            .find(|f| f.rel_str() == "a.rs")
+            .unwrap()
+            .hash;
+
+        // warm run: both files unchanged → both served from cache, identical hashes
+        let warm = Scan::run(&base, &cfg);
+        assert_eq!(warm.cache_hits, 2, "both files should hit the cache");
+        assert_eq!(
+            warm.files
+                .iter()
+                .find(|f| f.rel_str() == "a.rs")
+                .unwrap()
+                .hash,
+            a_hash
+        );
+
+        // change one file → it misses, the other still hits
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(base.join("a.rs"), "fn a() { changed(); }\n").unwrap();
+        let after = Scan::run(&base, &cfg);
+        assert_eq!(after.cache_hits, 1, "only the unchanged file should hit");
+        let a_new = after
+            .files
+            .iter()
+            .find(|f| f.rel_str() == "a.rs")
+            .unwrap()
+            .hash;
+        assert_ne!(a_new, a_hash, "changed file must be re-hashed");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn cache_never_masks_same_size_content_change() {
+        // adversarial: same byte length, different content, mtime forced to move.
+        let base = probe("cache_samesize");
+        fs::write(base.join("x.rs"), "AAAA\n").unwrap();
+        let cache = base.join(".bonsai").join("scan-cache.json");
+        let cfg = ScanConfig::gate().with_cache(cache);
+        let h1 = Scan::run(&base, &cfg).files[0].hash;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(base.join("x.rs"), "BBBB\n").unwrap(); // same length, new mtime
+        let h2 = Scan::run(&base, &cfg).files[0].hash;
+        assert_ne!(
+            h1, h2,
+            "same-size content change must not be masked by the cache"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 }

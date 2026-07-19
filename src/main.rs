@@ -78,11 +78,17 @@ enum Cmd {
         /// Refresh the committed ratchet baseline (bonsai.lean.json).
         #[arg(long)]
         save: bool,
+        /// Disable the incremental scan cache (.bonsai/scan-cache.json).
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Fail-closed gate: tree invariants + leanness ratchet (CI / pre-commit).
     Check {
         #[arg(long, default_value = ".")]
         root: PathBuf,
+        /// Disable the incremental scan cache (.bonsai/scan-cache.json).
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Docs plane: run the recursive compose executor (byte-identity gate + recursion).
     Docs {
@@ -127,8 +133,12 @@ fn main() -> Result<()> {
             root,
             write,
         } => cmd_move(&root, &from, &to, write),
-        Cmd::Lean { root, save } => cmd_lean(&root, save),
-        Cmd::Check { root } => cmd_check(&root),
+        Cmd::Lean {
+            root,
+            save,
+            no_cache,
+        } => cmd_lean(&root, save, !no_cache),
+        Cmd::Check { root, no_cache } => cmd_check(&root, !no_cache),
         Cmd::Docs { root } => cmd_docs(&root),
         Cmd::Index {
             root,
@@ -347,11 +357,17 @@ fn cmd_docs(root: &Path) -> Result<()> {
 
 const LEAN_BASELINE: &str = "bonsai.lean.json";
 
-fn cmd_lean(root: &Path, save: bool) -> Result<()> {
+fn cmd_lean(root: &Path, save: bool, cache: bool) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
-    // one parallel content pass feeds both the exact-dup report and near-duplicates
-    let scan = bonsai::scan::Scan::run(root, &bonsai::scan::ScanConfig::with_shingles());
+    // one parallel content pass feeds both the exact-dup report and near-duplicates.
+    // (near-dup needs shingles, which need a read, so the cache warms but doesn't skip reads
+    // here; it still refreshes so the next `check` is fast.)
+    let mut scfg = bonsai::scan::ScanConfig::with_shingles();
+    if cache {
+        scfg = scfg.with_cache(bonsai::scan::ScanConfig::default_cache_path(root));
+    }
+    let scan = bonsai::scan::Scan::run(root, &scfg);
     let mut r = bonsai::lean::analyze_from_scan(&tree, &scan);
     // measure SCIP-backed signals if an index is present (moves them out of "deferred")
     r.dead_code = bonsai::lean::dead_code_count(root);
@@ -367,6 +383,12 @@ fn cmd_lean(root: &Path, save: bool) -> Result<()> {
         "bonsai lean — {} files, {} composites, depth {}",
         r.files, r.composites, r.max_depth
     );
+    if scan.cache_hits > 0 || scan.over_cap > 0 || scan.unreadable > 0 {
+        println!(
+            "  scan           : {} cache hit(s), {} over-cap, {} unreadable",
+            scan.cache_hits, scan.over_cap, scan.unreadable
+        );
+    }
     if let Some(n) = r.dead_code {
         println!("  dead symbols   : {n}  (SCIP-measured)");
     }
@@ -434,7 +456,7 @@ fn cmd_lean(root: &Path, save: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_check(root: &Path) -> Result<()> {
+fn cmd_check(root: &Path, cache: bool) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
     let mut errs = tree.check();
@@ -445,7 +467,13 @@ fn cmd_check(root: &Path) -> Result<()> {
         let baseline: bonsai::lean::LeanBaseline =
             serde_json::from_str(&std::fs::read_to_string(&baseline_path)?)
                 .with_context(|| format!("parsing {LEAN_BASELINE}"))?;
-        let mut report = bonsai::lean::analyze(&tree, root);
+        // the fast gate: hashes + line counts, incremental cache, no shingles
+        let mut scfg = bonsai::scan::ScanConfig::gate();
+        if cache {
+            scfg = scfg.with_cache(bonsai::scan::ScanConfig::default_cache_path(root));
+        }
+        let scan = bonsai::scan::Scan::run(root, &scfg);
+        let mut report = bonsai::lean::analyze_from_scan(&tree, &scan);
         report.dead_code = bonsai::lean::dead_code_count(root);
         report.misplaced = bonsai::lean::misplacement_count(root);
         for reg in baseline.regressions(&report) {

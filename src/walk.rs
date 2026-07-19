@@ -8,9 +8,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Skip these regardless of `.gitignore` (VCS/build/cache trees that may be tracked).
+/// `.bonsai` holds Bonsai's own scan cache — never treat it as repo structure.
 pub const DEFAULT_SKIP: &[&str] = &[
     "target",
     ".git",
+    ".bonsai",
     "node_modules",
     "__pycache__",
     ".venv",
