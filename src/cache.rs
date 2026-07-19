@@ -7,10 +7,14 @@
 //! (eslintcache, mypy, cargo) — and reuses the stored blake3 hash, line count, and
 //! text/binary flag when both match, skipping the read entirely.
 //!
-//! It is a pure accelerator: a miss (new file, changed size/mtime, or a bumped
-//! [`CACHE_VERSION`]) simply reads and recomputes, and the result is never *trusted* over the
-//! filesystem — a stale or corrupt cache can only cost a re-read, never a wrong answer. The
-//! file is written atomically (temp + rename) so a crashed or concurrent run can't corrupt it.
+//! Trust model — the standard `(size, mtime)` tradeoff, stated honestly. On every modern
+//! filesystem (ext4/xfs/btrfs/APFS/NTFS record nanosecond or 100-ns mtime), any write moves the
+//! mtime, so a changed file always misses and is re-read. The one way to fool the cache is a
+//! content change that preserves BOTH the byte length AND the mtime — which needs coarse (≥1 s)
+//! mtime granularity plus two writes within the same tick, possible on FAT/exFAT but not on a
+//! dev or CI checkout. A corrupt or version-mismatched cache is discarded wholesale (empty →
+//! full recompute), and the file is written atomically (temp + rename) so a crashed or
+//! concurrent run can't corrupt it. `--no-cache` sidesteps the tradeoff entirely.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -21,7 +25,8 @@ use std::time::UNIX_EPOCH;
 pub const CACHE_VERSION: u32 = 1;
 
 /// One cached file fingerprint. `hash`/`lines`/`is_binary` are reused only when the live
-/// `(size, mtime)` still match, so they never diverge from disk without a miss.
+/// `(size, mtime)` still match — so on any filesystem with sub-write mtime resolution they never
+/// diverge from disk without a miss (see the module trust-model note for the coarse-mtime caveat).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
     pub size: u64,
