@@ -86,6 +86,11 @@ enum Cmd {
         #[arg(long, default_value = ".")]
         root: PathBuf,
     },
+    /// Stitch the Python↔Rust FFI boundary (PyO3 exports ↔ Python imports) + print edges.
+    Ffi {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
     /// Parse a SCIP index into the code graph (symbols, ref edges, file DAG) + print stats.
     Index {
         #[arg(long, default_value = ".")]
@@ -115,7 +120,47 @@ fn main() -> Result<()> {
         Cmd::Check { root } => cmd_check(&root),
         Cmd::Docs { root } => cmd_docs(&root),
         Cmd::Index { root, scip, generate } => cmd_index(&root, scip.as_deref(), generate),
+        Cmd::Ffi { root } => cmd_ffi(&root),
     }
+}
+
+/// Stitch and report the Python↔Rust FFI boundary — the permanent cross-language edges SCIP
+/// can't see (it indexes each language alone). Nothing else joins these graphs.
+fn cmd_ffi(root: &Path) -> Result<()> {
+    let g = bonsai::ffi::scan(root);
+    let modules = g
+        .exports
+        .iter()
+        .filter(|e| matches!(e.kind, bonsai::ffi::ExportKind::Module))
+        .count();
+    println!(
+        "bonsai ffi — {} PyO3 exports ({} module(s)), {} Python imports, {} stitched edge(s)",
+        g.exports.len(),
+        modules,
+        g.imports.len(),
+        g.edges.len()
+    );
+    // group edges by module
+    let mut by_mod: BTreeMap<&str, Vec<&bonsai::ffi::FfiEdge>> = BTreeMap::new();
+    for e in &g.edges {
+        by_mod.entry(&e.module).or_default().push(e);
+    }
+    for (module, edges) in &by_mod {
+        let rust = edges.first().map(|e| e.rust_file.as_str()).unwrap_or("?");
+        println!("\n  ⟷ {module}  (Rust: {rust})");
+        for e in edges {
+            let names = if e.names.is_empty() {
+                "*".to_string()
+            } else {
+                e.names.join(", ")
+            };
+            println!("     {}:{}  imports [{}]", e.py_file, e.py_line, names);
+        }
+    }
+    if g.edges.is_empty() {
+        println!("  (no FFI boundary found — no #[pymodule] imported from Python under this root)");
+    }
+    Ok(())
 }
 
 /// Parse (optionally generate) a SCIP index into the code graph and report stats. The

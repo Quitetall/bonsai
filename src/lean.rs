@@ -275,6 +275,7 @@ mod tests {
             min_score: 1.0,
             max_dup_files: 0,
             max_empty_dirs: 0,
+            max_dead: None,
         };
         assert!(!strict.regressions(&r).is_empty());
         let _ = fs::remove_dir_all(&base);
