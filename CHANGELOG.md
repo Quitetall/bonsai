@@ -23,6 +23,8 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
   immutable history, bounded BQL dependency/impact traversal, and a read-only GraphQL projection.
 - **Repository authority discovery** for conventional blueprint and SCIP paths, enabling harnesses
   to rebuild `main` before agent queries while leaving historical snapshots immutable.
+- **Fail-closed SCIP freshness** for current snapshots when tracked sources are newer than a
+  discovered compiler index.
 - **Katana integration** through brokered MCP tools, replay-recorded results, a native deterministic
   Bonsai oracle, and optional data-only impact/shape-safe workflows.
 - **LamQuant production proof** locking the existing LML lossless pipeline and its typed-chain,

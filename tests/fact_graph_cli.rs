@@ -99,3 +99,38 @@ id = "ingest"
         .success());
     assert!(dir.path().join(".bonsai/facts.db").exists());
 }
+
+#[test]
+fn current_snapshot_fails_closed_on_a_stale_scip_index() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("index.scip"), b"stale").unwrap();
+    assert!(Command::new("touch")
+        .args(["-d", "2000-01-01T00:00:00Z"])
+        .arg(dir.path().join("index.scip"))
+        .status()
+        .unwrap()
+        .success());
+    fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    assert!(Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["add", "src/main.rs"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap()
+        .success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bonsai"))
+        .args(["graph", "--root"])
+        .arg(dir.path())
+        .args(["snapshot", "--discover", "--require-fresh-scip"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is stale"));
+}

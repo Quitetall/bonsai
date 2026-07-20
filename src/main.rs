@@ -114,6 +114,9 @@ enum GraphAction {
         /// Discover conventional blueprints and SCIP indices under the graph root.
         #[arg(long)]
         discover: bool,
+        /// When SCIP indices exist, fail if any tracked source is newer than an index.
+        #[arg(long, requires = "discover")]
+        require_fresh_scip: bool,
         #[arg(long)]
         parent: Option<String>,
         #[arg(long = "ref", default_value = "main")]
@@ -519,6 +522,81 @@ fn discover_graph_inputs(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (blueprints.into_iter().collect(), scip.into_iter().collect())
 }
 
+fn require_fresh_scip_indices(root: &Path, indices: &[PathBuf]) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .context("listing tracked files for SCIP freshness")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot verify SCIP freshness because git ls-files failed"
+    );
+    let source_extension = |path: &Path| {
+        matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some(
+                "rs" | "py"
+                    | "c"
+                    | "h"
+                    | "cc"
+                    | "cpp"
+                    | "hpp"
+                    | "go"
+                    | "java"
+                    | "kt"
+                    | "kts"
+                    | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "proto"
+            )
+        )
+    };
+    let mut newest_source = None;
+    for bytes in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+    {
+        let relative = PathBuf::from(String::from_utf8_lossy(bytes).into_owned());
+        if !source_extension(&relative) {
+            continue;
+        }
+        let path = root.join(&relative);
+        let modified = std::fs::metadata(&path)
+            .with_context(|| format!("reading tracked source metadata {}", path.display()))?
+            .modified()
+            .with_context(|| format!("reading tracked source mtime {}", path.display()))?;
+        let replace = match &newest_source {
+            None => true,
+            Some((_, newest)) => modified > *newest,
+        };
+        if replace {
+            newest_source = Some((relative, modified));
+        }
+    }
+    let Some((source, source_time)) = newest_source else {
+        return Ok(());
+    };
+    for index in indices {
+        let path = rooted(root, index.clone());
+        let modified = std::fs::metadata(&path)
+            .with_context(|| format!("reading SCIP index metadata {}", path.display()))?
+            .modified()
+            .with_context(|| format!("reading SCIP index mtime {}", path.display()))?;
+        anyhow::ensure!(
+            modified >= source_time,
+            "SCIP index '{}' is stale: tracked source '{}' is newer; regenerate compiler indices before querying current code facts",
+            path.display(),
+            source.display()
+        );
+    }
+    Ok(())
+}
+
 fn cmd_graph(root: &Path, action: GraphAction) -> Result<()> {
     match action {
         GraphAction::Snapshot {
@@ -526,6 +604,7 @@ fn cmd_graph(root: &Path, action: GraphAction) -> Result<()> {
             mut blueprint,
             mut scip,
             discover,
+            require_fresh_scip,
             parent,
             reference,
         } => {
@@ -537,6 +616,9 @@ fn cmd_graph(root: &Path, action: GraphAction) -> Result<()> {
                 blueprint.dedup();
                 scip.sort();
                 scip.dedup();
+            }
+            if require_fresh_scip && !scip.is_empty() {
+                require_fresh_scip_indices(root, &scip)?;
             }
             anyhow::ensure!(
                 !blueprint.is_empty() || !scip.is_empty(),

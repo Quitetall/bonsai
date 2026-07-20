@@ -89,7 +89,7 @@ bonsai blueprint scaffold architecture/codec.toml --language rust --out src/cont
 
 # Repository fact graph and query surfaces
 bonsai graph snapshot --blueprint architecture/codec.toml --ref main
-bonsai graph --root . snapshot --discover --ref main  # conventional blueprints + SCIP indices
+bonsai graph --root . snapshot --discover --require-fresh-scip --ref main
 bonsai graph query --snapshot main --bql 'IMPACT codec.v1#slot/predict DEPTH 3'
 bonsai graph graphql --query '{ impact(entity: "codec.v1#slot/predict", depth: 3) { entities } }'
 ```
@@ -136,7 +136,8 @@ projected through read-only GraphQL for tools that prefer a schema-driven API.
 `graph snapshot --discover` rebuilds from `bonsai.blueprint.toml`,
 `.bonsai/blueprints/*.toml`, and SCIP indices at `index.scip`, `.bonsai/index.scip`, or
 `.bonsai/indexes/*.scip`. This is the refresh seam used by Katana before querying `main`;
-explicit historical snapshots are queried without mutation.
+explicit historical snapshots are queried without mutation. With `--require-fresh-scip`, Bonsai
+fails before ingestion when a tracked source file is newer than any discovered compiler index.
 
 This split is intentional: SQLite and deterministic traversal are the authority; BQL and GraphQL
 are interfaces over it. The first source adapters ingest blueprints and SCIP symbol/file
