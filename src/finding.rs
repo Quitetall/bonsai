@@ -134,6 +134,10 @@ pub const RULES: &[(&str, &str)] = &[
         "A file used exclusively from one other directory — belongs there.",
     ),
     (
+        "structure-cycle",
+        "A dependency cycle in the real code graph (mutually-entangled modules).",
+    ),
+    (
         "tree-invariant",
         "A structural invariant of the capability tree is violated.",
     ),

@@ -22,8 +22,35 @@ pub fn evaluate(tree: &Tree, graph: Option<&CodeGraph>, rules: &Rules) -> Vec<Fi
     if let Some(g) = graph {
         layering(tree, g, rules, &mut out);
         placement(g, rules, &mut out);
+        cycles(g, rules, &mut out);
     }
     out
+}
+
+/// Structural-inefficiency rail: a dependency cycle in the real code graph fails the gate when
+/// `forbid_cycles` is set (it's always *reported* by `lean`, but gating is opt-in per repo).
+fn cycles(graph: &CodeGraph, rules: &Rules, out: &mut Vec<Finding>) {
+    if !rules.forbid_cycles {
+        return;
+    }
+    for scc in graph.dependency_cycles() {
+        let head = scc.first().cloned().unwrap_or_default();
+        out.push(
+            Finding::new(
+                "structure-cycle",
+                Severity::Error,
+                format!(
+                    "dependency cycle among {} modules: {}",
+                    scc.len(),
+                    scc.join(" → ")
+                ),
+                Location::file(head),
+            )
+            .with_fix(
+                "break the cycle: extract the shared piece to a lower layer, or invert one edge",
+            ),
+        );
+    }
 }
 
 /// Anti-abstraction-hell: bound how deep the abstraction stack may go. Abstractions constrain the

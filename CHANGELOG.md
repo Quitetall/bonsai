@@ -5,6 +5,12 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — structural health
+- **Dependency-cycle detection** (`CodeGraph::dependency_cycles`, iterative Tarjan SCC over the
+  real `file_deps` graph): mutually-entangled module groups — the canonical structural-inefficiency
+  smell — are reported by `lean` (warning) and gated by `check` when `[rules] forbid_cycles = true`.
+  Monorepo-safe (no recursion). New `structure-cycle` rule.
+
 ### Added — governed growth
 - **Placement oracle** (`bonsai place <file>`): ranks the directories a file couples to and names
   its home — exact SCIP coupling for an indexed file, `crate::`-import scan for a new one; prints

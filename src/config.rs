@@ -86,6 +86,10 @@ pub struct Rules {
     /// rather than merely being reported — enforcing that code lives in its coupled home.
     #[serde(default)]
     pub enforce_placement: bool,
+    /// When true, a **dependency cycle** in the real code graph (mutually-entangled modules)
+    /// *fails* the gate rather than merely being reported — the structural-inefficiency rail.
+    #[serde(default)]
+    pub forbid_cycles: bool,
     /// Ceiling on containment nesting depth (0 = unbounded). Abstractions flow top-down, but this
     /// bounds how deep the stack goes — no infinite tower of directories/indirection.
     #[serde(default)]

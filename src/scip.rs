@@ -307,6 +307,94 @@ impl CodeGraph {
         out
     }
 
+    /// **Dependency cycles** in the real code graph — the canonical structural-inefficiency smell
+    /// (module A uses B uses … uses A). Each returned group is a strongly-connected component of
+    /// the file-dependency DAG with more than one file (a genuine cycle); files within it are
+    /// mutually entangled and can't be understood, tested, or moved independently. Computed with
+    /// iterative Tarjan (bounded stack, so it holds on a monorepo-sized graph). Deterministic:
+    /// files within a component and the components themselves are sorted.
+    pub fn dependency_cycles(&self) -> Vec<Vec<String>> {
+        // index every file that appears as a dependency source or target
+        let mut names: Vec<String> = Vec::new();
+        let mut idx: BTreeMap<String, usize> = BTreeMap::new();
+        for (from, tos) in &self.file_deps {
+            for f in std::iter::once(from).chain(tos.iter()) {
+                if !idx.contains_key(f) {
+                    idx.insert(f.clone(), names.len());
+                    names.push(f.clone());
+                }
+            }
+        }
+        let n = names.len();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (from, tos) in &self.file_deps {
+            let u = idx[from];
+            for to in tos {
+                adj[u].push(idx[to]);
+            }
+        }
+
+        const UNVISITED: usize = usize::MAX;
+        let mut index = vec![UNVISITED; n];
+        let mut low = vec![0usize; n];
+        let mut on_stack = vec![false; n];
+        let mut scc_stack: Vec<usize> = Vec::new();
+        let mut next = 0usize;
+        let mut out: Vec<Vec<String>> = Vec::new();
+
+        for s in 0..n {
+            if index[s] != UNVISITED {
+                continue;
+            }
+            // explicit DFS stack of (node, next-child-cursor) — no recursion (monorepo-safe)
+            index[s] = next;
+            low[s] = next;
+            next += 1;
+            scc_stack.push(s);
+            on_stack[s] = true;
+            let mut call: Vec<(usize, usize)> = vec![(s, 0)];
+            while let Some(&(v, ci)) = call.last() {
+                if ci < adj[v].len() {
+                    call.last_mut().unwrap().1 += 1;
+                    let w = adj[v][ci];
+                    if index[w] == UNVISITED {
+                        index[w] = next;
+                        low[w] = next;
+                        next += 1;
+                        scc_stack.push(w);
+                        on_stack[w] = true;
+                        call.push((w, 0));
+                    } else if on_stack[w] {
+                        low[v] = low[v].min(index[w]);
+                    }
+                } else {
+                    if low[v] == index[v] {
+                        // pop one SCC
+                        let mut comp = Vec::new();
+                        loop {
+                            let w = scc_stack.pop().unwrap();
+                            on_stack[w] = false;
+                            comp.push(names[w].clone());
+                            if w == v {
+                                break;
+                            }
+                        }
+                        if comp.len() > 1 {
+                            comp.sort();
+                            out.push(comp);
+                        }
+                    }
+                    call.pop();
+                    if let Some(&(p, _)) = call.last() {
+                        low[p] = low[p].min(low[v]);
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Symbols reachable from `entry` symbols by following reference edges (BFS closure).
     pub fn reachable(&self, entry: &BTreeSet<String>) -> BTreeSet<String> {
         let mut seen: BTreeSet<String> = entry.clone();
@@ -523,6 +611,47 @@ mod tests {
         idx.documents.push(d);
         let g = CodeGraph::from_index(&idx);
         assert!(g.symbols.is_empty());
+    }
+
+    #[test]
+    fn dependency_cycles_finds_sccs_only() {
+        let mut g = CodeGraph::default();
+        // cycle: a.rs -> b.rs -> c.rs -> a.rs
+        g.file_deps
+            .entry("a.rs".into())
+            .or_default()
+            .insert("b.rs".into());
+        g.file_deps
+            .entry("b.rs".into())
+            .or_default()
+            .insert("c.rs".into());
+        g.file_deps
+            .entry("c.rs".into())
+            .or_default()
+            .insert("a.rs".into());
+        // an acyclic tail: d.rs -> a.rs (not part of the cycle)
+        g.file_deps
+            .entry("d.rs".into())
+            .or_default()
+            .insert("a.rs".into());
+
+        let cycles = g.dependency_cycles();
+        assert_eq!(cycles.len(), 1, "exactly one cycle: {cycles:?}");
+        assert_eq!(cycles[0], vec!["a.rs", "b.rs", "c.rs"], "the SCC, sorted");
+
+        // a purely acyclic graph has no cycles
+        let mut acyclic = CodeGraph::default();
+        acyclic
+            .file_deps
+            .entry("x.rs".into())
+            .or_default()
+            .insert("y.rs".into());
+        acyclic
+            .file_deps
+            .entry("y.rs".into())
+            .or_default()
+            .insert("z.rs".into());
+        assert!(acyclic.dependency_cycles().is_empty(), "DAG has no cycles");
     }
 
     #[test]

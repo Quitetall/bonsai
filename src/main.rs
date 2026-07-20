@@ -687,6 +687,18 @@ fn lean_findings(
                 .with_fix("sequester (dead code is moved to deprecated/, never deleted)"),
             );
         }
+        for scc in g.dependency_cycles() {
+            let head = scc.first().cloned().unwrap_or_default();
+            out.push(
+                Finding::new(
+                    "structure-cycle",
+                    Severity::Warning,
+                    format!("dependency cycle among {} modules: {}", scc.len(), scc.join(" → ")),
+                    Location::file(head),
+                )
+                .with_fix("break the cycle: extract the shared piece to a lower layer, or invert one edge"),
+            );
+        }
         for m in g.misplacements() {
             out.push(
                 Finding::new(
@@ -753,6 +765,18 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
         }
         if let Some(n) = r.misplaced {
             println!("  misplaced files: {n}  (SCIP-measured)");
+        }
+        if let Some(g) = &graph {
+            let cyc = g.dependency_cycles();
+            if !cyc.is_empty() {
+                println!(
+                    "  dependency cycles: {}  (mutually-entangled module groups)",
+                    cyc.len()
+                );
+                for scc in cyc.iter().take(4) {
+                    println!("    ⟲ {}", scc.join(" → "));
+                }
+            }
         }
         println!(
             "  leanness score : {:.4}  (1.0 = no measured waste)",
