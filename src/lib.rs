@@ -13,6 +13,7 @@
 //! - **Facets** — cross-cutting axes (plane, layer, repo, diataxis, …), not branches.
 
 pub mod cache;
+pub mod clones;
 pub mod config;
 pub mod contracts;
 pub mod ffi;

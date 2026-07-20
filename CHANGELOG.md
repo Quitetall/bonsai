@@ -5,6 +5,14 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — duplication, deeper
+- **Function-level clone detection** (`clones.rs`, surfaced by `lean`): extracts each function
+  body (brace-matched, string/comment-safe), normalizes away comments/whitespace, and groups
+  byte-identical normalized bodies across files — the copy-pasted-function (Type-1/2) clones that
+  file-level dup misses. Excludes the signature (so renamed clones still match), trivial bodies
+  (min-lines threshold), and `#[cfg(test)]` regions. New `clone-function` rule. Dogfood: 129
+  clone groups surfaced on LamQuant.
+
 ### Added — ergonomics
 - **Diff-scoped checking** — `bonsai check --staged` (index vs HEAD) / `--since <ref>` scope
   file-level findings to the changed files, so the pre-commit hook judges *the addition* rather

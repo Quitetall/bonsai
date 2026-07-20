@@ -122,6 +122,10 @@ pub const RULES: &[(&str, &str)] = &[
         "Highly similar (but not identical) files — likely divergent copies.",
     ),
     (
+        "clone-function",
+        "A function body copy-pasted across files (Type-1/2 clone).",
+    ),
+    (
         "empty-dir",
         "A directory with no tracked files (dead structure).",
     ),

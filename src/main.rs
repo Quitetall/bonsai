@@ -643,6 +643,27 @@ fn lean_findings(
     let mut out = Vec::new();
     if let Some(ws) = ws {
         out.extend(bonsai::forgotten::evaluate(ws)); // unwired + undocumented ("nothing forgotten")
+        for g in bonsai::clones::function_clones(ws, 6) {
+            let (file, name, line) = &g.sites[0];
+            let others: Vec<Location> = g.sites[1..]
+                .iter()
+                .map(|(f, _, l)| Location::at(f.clone(), *l))
+                .collect();
+            out.push(
+                Finding::new(
+                    "clone-function",
+                    Severity::Warning,
+                    format!(
+                        "`{name}` ({} lines) is copy-pasted across {} sites",
+                        g.lines,
+                        g.sites.len()
+                    ),
+                    Location::at(file.clone(), *line),
+                )
+                .with_related(others)
+                .with_fix("extract the shared function to one home and call it from each site"),
+            );
+        }
     }
     for g in &r.dup_groups {
         let related = g.files[1..].iter().map(Location::file).collect();
@@ -755,11 +776,15 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
         r.deferred
             .retain(|d| !d.starts_with("dead-code") && !d.starts_with("misplacement"));
     }
-    // the "forgotten" fold reads the .rs sources (unwired modules + undocumented pub API)
+    // the "forgotten" fold + function-clone detection read the .rs sources
     let ws = Workspace::from_dir(root).ok();
     let forgotten = ws
         .as_ref()
         .map(bonsai::forgotten::evaluate)
+        .unwrap_or_default();
+    let clones = ws
+        .as_ref()
+        .map(|w| bonsai::clones::function_clones(w, 6))
         .unwrap_or_default();
 
     if format != Format::Text {
@@ -816,6 +841,21 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
                 .take(6)
             {
                 println!("    ⚠ {}", f.location.file);
+            }
+        }
+        if !clones.is_empty() {
+            println!(
+                "  function clones: {} group(s) (copy-pasted logic)",
+                clones.len()
+            );
+            for g in clones.iter().take(6) {
+                let names: Vec<&str> = g.sites.iter().map(|(_, n, _)| n.as_str()).collect();
+                println!(
+                    "    ⧉ {} lines ×{}: {}",
+                    g.lines,
+                    g.sites.len(),
+                    names.join(", ")
+                );
             }
         }
         println!(
