@@ -526,7 +526,13 @@ fn require_fresh_scip_indices(root: &Path, indices: &[PathBuf]) -> Result<()> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "-z"])
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
         .output()
         .context("listing tracked files for SCIP freshness")?;
     anyhow::ensure!(
@@ -1469,6 +1475,42 @@ fn changed_files(
     Some(set)
 }
 
+fn blueprint_binding_errors(root: &Path, blueprint: &Blueprint) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut check = |kind: &str, id: &str, binding: &str| {
+        let Some((file, symbol)) = binding.split_once('#') else {
+            errors.push(format!(
+                "{kind} '{id}': binding '{binding}' must use <repo-path>#<symbol>"
+            ));
+            return;
+        };
+        if file.trim().is_empty() || symbol.trim().is_empty() {
+            errors.push(format!(
+                "{kind} '{id}': binding '{binding}' must name both a file and symbol"
+            ));
+            return;
+        }
+        let path = rooted(root, PathBuf::from(file));
+        if !path.is_file() {
+            errors.push(format!(
+                "{kind} '{id}': binding file '{}' does not exist",
+                path.display()
+            ));
+        }
+    };
+    for implementation in &blueprint.implementations {
+        for binding in &implementation.bindings {
+            check("implementation", &implementation.id, binding);
+        }
+    }
+    for adapter in &blueprint.adapters {
+        check("adapter", &adapter.id, &adapter.binding);
+    }
+    errors.sort();
+    errors.dedup();
+    errors
+}
+
 fn check_blueprint_locks(root: &Path) -> Vec<Finding> {
     let mut paths = Vec::new();
     let root_blueprint = root.join("bonsai.blueprint.toml");
@@ -1521,7 +1563,10 @@ fn check_blueprint_locks(root: &Path) -> Vec<Finding> {
             ));
         }
         let validation = blueprint.validate();
-        for error in validation {
+        for error in validation
+            .into_iter()
+            .chain(blueprint_binding_errors(root, &blueprint))
+        {
             findings.push(Finding::new(
                 "blueprint-lock",
                 Severity::Error,

@@ -118,13 +118,6 @@ fn current_snapshot_fails_closed_on_a_stale_scip_index() {
         .status()
         .unwrap()
         .success());
-    assert!(Command::new("git")
-        .args(["add", "src/main.rs"])
-        .current_dir(dir.path())
-        .status()
-        .unwrap()
-        .success());
-
     let output = Command::new(env!("CARGO_BIN_EXE_bonsai"))
         .args(["graph", "--root"])
         .arg(dir.path())

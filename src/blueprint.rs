@@ -270,6 +270,17 @@ impl Blueprint {
             if implementation.slots.is_empty() {
                 errors.push(format!("implementation '{}': no slots", implementation.id));
             }
+            if implementation.bindings.is_empty()
+                || implementation
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.trim().is_empty())
+            {
+                errors.push(format!(
+                    "implementation '{}': no concrete bindings",
+                    implementation.id
+                ));
+            }
             for slot in &implementation.slots {
                 if !slots.contains(slot.as_str()) {
                     errors.push(format!(
@@ -419,12 +430,32 @@ impl Blueprint {
                             .all(|binding| !binding.trim().is_empty())
                 })
             };
+            let compatibility_witness = new
+                .witnesses
+                .iter()
+                .any(|witness| witness.covers.iter().any(|item| item == &historical.id));
+            if !compatibility_witness {
+                errors.push(format!(
+                    "historical permanent port '{}' has no compatibility witness covering it",
+                    historical.id
+                ));
+            }
             let native = current_ports
                 .get(historical.id.as_str())
-                .is_some_and(|port| slot_is_executable(&port.slot));
+                .is_some_and(|port| slot_is_executable(&port.slot))
+                && compatibility_witness;
             let direct_adapter = new.adapters.iter().any(|adapter| {
                 adapter.from == historical.id
                     && !adapter.binding.trim().is_empty()
+                    && adapter.witnesses.iter().any(|id| {
+                        new.witnesses.iter().any(|witness| {
+                            witness.id == *id
+                                && witness
+                                    .covers
+                                    .iter()
+                                    .any(|covered| covered == &historical.id)
+                        })
+                    })
                     && current_ports
                         .get(adapter.to.as_str())
                         .is_some_and(|port| slot_is_executable(&port.slot))

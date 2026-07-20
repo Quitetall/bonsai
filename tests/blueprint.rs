@@ -60,7 +60,7 @@ bindings = ["src/stage.rs#PredictPass"]
 id = "byte-equal"
 kind = "differential"
 command = "cargo test byte_equal"
-covers = ["transform", "predict"]
+covers = ["transform", "predict", "raw", "residuals"]
 "#;
 
 #[test]
@@ -232,6 +232,16 @@ fn evolution_preserves_every_historical_permanent_port() {
     assert!(Blueprint::validate_evolution(&old, &isolated)
         .iter()
         .any(|error| error.contains("no executable native or direct-adapter path")));
+
+    let mut irrelevant_evidence = old.clone();
+    irrelevant_evidence.meta.id = "codec.lossless.v2".into();
+    irrelevant_evidence.meta.supersedes = Some(old.meta.id.clone());
+    irrelevant_evidence.witnesses[0]
+        .covers
+        .retain(|covered| covered != "raw");
+    assert!(Blueprint::validate_evolution(&old, &irrelevant_evidence)
+        .iter()
+        .any(|error| error.contains("permanent port 'raw' has no compatibility witness")));
 }
 
 #[test]
