@@ -36,7 +36,10 @@ pub fn function_clones(ws: &Workspace, min_lines: usize) -> Vec<CloneGroup> {
     let mut funcs: Vec<Func> = Vec::new();
     for (path, text) in &ws.files {
         let file = path.to_string_lossy().to_string();
-        extract_functions(&file, text, min_lines, &mut funcs);
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("py") => extract_functions_py(&file, text, min_lines, &mut funcs),
+            _ => extract_functions(&file, text, min_lines, &mut funcs),
+        }
     }
     // group by normalized-body hash
     let mut by_hash: BTreeMap<u64, Vec<&Func>> = BTreeMap::new();
@@ -134,6 +137,76 @@ fn extract_functions(file: &str, text: &str, min_lines: usize, out: &mut Vec<Fun
             i += 1;
         }
     }
+}
+
+/// Extract each Python `def`/`async def` body by indentation (the block is the run of
+/// deeper-indented lines, blank lines included), normalize it, and record it when ≥ `min_lines`.
+/// Excludes `def test_*` (pytest cases duplicate legitimately). A `#` line comment is stripped.
+fn extract_functions_py(file: &str, text: &str, min_lines: usize, out: &mut Vec<Func>) {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some((name, indent)) = py_def(lines[i]) else {
+            i += 1;
+            continue;
+        };
+        let mut body: Vec<String> = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() {
+            let bl = lines[j];
+            if bl.trim().is_empty() {
+                j += 1;
+                continue; // blank lines don't end a Python block
+            }
+            let bindent = bl.len() - bl.trim_start().len();
+            if bindent <= indent {
+                break; // dedent → block ended
+            }
+            body.push(normalize_py_line(bl));
+            j += 1;
+        }
+        if !name.starts_with("test_") {
+            let norm: Vec<String> = body.into_iter().filter(|l| !l.is_empty()).collect();
+            if norm.len() >= min_lines {
+                out.push(Func {
+                    file: file.to_string(),
+                    name,
+                    line: (i + 1) as u32,
+                    norm_hash: fnv1a(norm.join("\n").as_bytes()),
+                    norm_lines: norm.len(),
+                });
+            }
+        }
+        i = j;
+    }
+}
+
+/// A Python `def`/`async def` line → `(name, indent)`, or `None`.
+fn py_def(line: &str) -> Option<(String, usize)> {
+    let indent = line.len() - line.trim_start().len();
+    let t = line.trim_start();
+    let rest = t
+        .strip_prefix("def ")
+        .or_else(|| t.strip_prefix("async def "))?;
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty() && rest.contains('(')).then_some((name, indent))
+}
+
+/// Normalize a Python body line: drop a `#` line comment (when not inside a string), trim + collapse.
+fn normalize_py_line(line: &str) -> String {
+    let code = match line.find('#') {
+        Some(pos)
+            if line[..pos].matches('"').count().is_multiple_of(2)
+                && line[..pos].matches('\'').count().is_multiple_of(2) =>
+        {
+            &line[..pos]
+        }
+        _ => line,
+    };
+    code.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The function name a line declares (`fn foo(`, `pub fn foo(`, `pub(crate) async fn foo<...>(`),
@@ -241,6 +314,35 @@ mod tests {
         assert!(
             function_clones(&ws, 5).is_empty(),
             "trivial + test fns must not clone"
+        );
+    }
+
+    #[test]
+    fn detects_python_function_clones_by_indentation() {
+        let body = "    total = 0\n    for x in items:\n        total += x * 2\n        total -= 1\n    return total\n";
+        let ws = Workspace::from_pairs(
+            ".",
+            [
+                ("a.py", format!("def compute(items):\n{body}\n").as_str()),
+                ("b.py", format!("def tally(items):\n{body}\n").as_str()),
+                // a pytest case with the same body must NOT be flagged
+                (
+                    "test_x.py",
+                    format!("def test_compute(items):\n{body}\n").as_str(),
+                ),
+            ],
+        );
+        let groups = function_clones(&ws, 4);
+        assert_eq!(
+            groups.len(),
+            1,
+            "one py clone group (test_ excluded): {groups:?}"
+        );
+        let names: Vec<&str> = groups[0].sites.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"compute")
+                && names.contains(&"tally")
+                && !names.contains(&"test_compute")
         );
     }
 

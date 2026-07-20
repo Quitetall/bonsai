@@ -80,9 +80,15 @@ impl Workspace {
     /// Build from disk: every `.rs` file under `root` (respecting `.gitignore` via the shared
     /// walk policy). Paths are stored repo-relative so plans and diffs are location-independent.
     pub fn from_dir(root: impl AsRef<Path>) -> std::io::Result<Self> {
+        Self::from_dir_ext(root, &["rs"])
+    }
+
+    /// Like [`from_dir`](Self::from_dir) but reads the given extensions (e.g. `["rs", "py"]` for a
+    /// polyglot read-only analyzer such as clone detection).
+    pub fn from_dir_ext(root: impl AsRef<Path>, exts: &[&str]) -> std::io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         let mut files = BTreeMap::new();
-        for rel in crate::walk::files_with_ext(&root, &[], &["rs"]) {
+        for rel in crate::walk::files_with_ext(&root, &[], exts) {
             if let Ok(text) = std::fs::read_to_string(root.join(&rel)) {
                 files.insert(rel, text);
             }

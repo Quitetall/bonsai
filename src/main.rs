@@ -639,31 +639,32 @@ fn lean_findings(
     near: &[bonsai::lean::NearDup],
     graph: Option<&bonsai::scip::CodeGraph>,
     ws: Option<&Workspace>,
+    clones: &[bonsai::clones::CloneGroup],
 ) -> Vec<Finding> {
     let mut out = Vec::new();
     if let Some(ws) = ws {
         out.extend(bonsai::forgotten::evaluate(ws)); // unwired + undocumented ("nothing forgotten")
-        for g in bonsai::clones::function_clones(ws, 6) {
-            let (file, name, line) = &g.sites[0];
-            let others: Vec<Location> = g.sites[1..]
-                .iter()
-                .map(|(f, _, l)| Location::at(f.clone(), *l))
-                .collect();
-            out.push(
-                Finding::new(
-                    "clone-function",
-                    Severity::Warning,
-                    format!(
-                        "`{name}` ({} lines) is copy-pasted across {} sites",
-                        g.lines,
-                        g.sites.len()
-                    ),
-                    Location::at(file.clone(), *line),
-                )
-                .with_related(others)
-                .with_fix("extract the shared function to one home and call it from each site"),
-            );
-        }
+    }
+    for g in clones {
+        let (file, name, line) = &g.sites[0];
+        let others: Vec<Location> = g.sites[1..]
+            .iter()
+            .map(|(f, _, l)| Location::at(f.clone(), *l))
+            .collect();
+        out.push(
+            Finding::new(
+                "clone-function",
+                Severity::Warning,
+                format!(
+                    "`{name}` ({} lines) is copy-pasted across {} sites",
+                    g.lines,
+                    g.sites.len()
+                ),
+                Location::at(file.clone(), *line),
+            )
+            .with_related(others)
+            .with_fix("extract the shared function to one home and call it from each site"),
+        );
     }
     for g in &r.dup_groups {
         let related = g.files[1..].iter().map(Location::file).collect();
@@ -782,13 +783,21 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
         .as_ref()
         .map(bonsai::forgotten::evaluate)
         .unwrap_or_default();
-    let clones = ws
-        .as_ref()
-        .map(|w| bonsai::clones::function_clones(w, 6))
+    // clone detection spans Rust + Python (the polyglot "duplicated" signal); its own workspace.
+    let clones = Workspace::from_dir_ext(root, &["rs", "py"])
+        .ok()
+        .map(|w| bonsai::clones::function_clones(&w, 6))
         .unwrap_or_default();
 
     if format != Format::Text {
-        let report = Report::new(lean_findings(root, &r, &near, graph.as_ref(), ws.as_ref()));
+        let report = Report::new(lean_findings(
+            root,
+            &r,
+            &near,
+            graph.as_ref(),
+            ws.as_ref(),
+            &clones,
+        ));
         match format {
             Format::Json => println!("{}", report.to_json()),
             Format::Sarif => println!("{}", report.to_sarif()),

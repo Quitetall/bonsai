@@ -5,6 +5,18 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — polyglot duplication
+- **Python function-clone detection** — the clone fold now spans `.rs` (brace-matched) *and*
+  `.py` (indentation-based `def`/`async def` blocks); `Workspace::from_dir_ext` reads both. Excludes
+  `def test_*` (pytest cases duplicate legitimately). Extends the "duplicated" pillar to LamQuant's
+  Python half; dogfood surfaces 509 clone groups across the codebase.
+
+### Deferred
+- Move-engine SCIP-precision (nested `use crate::{…}` groups, `super::`/`self::`) is intentionally
+  NOT done via source-grep — it would risk corrupting code in a tool that promises "reference-safe."
+  It needs the SCIP symbol resolver (tracked deferred item in ADR 0134); the current resolver stays
+  correct-for-the-idiomatic-case and honestly warns on what it can't prove.
+
 ### Added — duplication, deeper
 - **Function-level clone detection** (`clones.rs`, surfaced by `lean`): extracts each function
   body (brace-matched, string/comment-safe), normalizes away comments/whitespace, and groups
