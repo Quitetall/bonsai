@@ -7,6 +7,7 @@ use bonsai::blueprint::{
     Blueprint, BlueprintLock, Lifecycle, ScaffoldLanguage, ShapeDiff, WitnessResult,
 };
 use bonsai::config::Config;
+use bonsai::facts::{facts_from_blueprint, BqlQuery, FactStore, SqliteFactStore};
 use bonsai::finding::{Finding, Location, Report, Severity};
 use bonsai::model::{Kind, NodeId, Plane};
 use bonsai::moves::{plan_move, Edit, Move, MovePlan, Workspace};
@@ -99,6 +100,44 @@ enum BlueprintAction {
     },
 }
 
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Create an immutable fact snapshot from one or more architecture blueprints.
+    Snapshot {
+        #[arg(long, default_value = ".bonsai/facts.db")]
+        db: PathBuf,
+        #[arg(long, required = true)]
+        blueprint: Vec<PathBuf>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long = "ref", default_value = "main")]
+        reference: String,
+    },
+    /// Run a bounded Bonsai Query Language dependency or impact query.
+    Query {
+        #[arg(long, default_value = ".bonsai/facts.db")]
+        db: PathBuf,
+        #[arg(long, default_value = "main")]
+        snapshot: String,
+        #[arg(long)]
+        bql: String,
+    },
+    /// Export all typed facts in a snapshot as JSON.
+    Export {
+        #[arg(long, default_value = ".bonsai/facts.db")]
+        db: PathBuf,
+        #[arg(long, default_value = "main")]
+        snapshot: String,
+    },
+    /// Execute a read-only GraphQL query over the deterministic fact graph.
+    Graphql {
+        #[arg(long, default_value = ".bonsai/facts.db")]
+        db: PathBuf,
+        #[arg(long)]
+        query: String,
+    },
+}
+
 #[derive(Parser)]
 #[command(
     name = "bonsai",
@@ -116,6 +155,11 @@ enum Cmd {
     Blueprint {
         #[command(subcommand)]
         action: BlueprintAction,
+    },
+    /// Build and query immutable, provenance-bearing repository fact snapshots.
+    Graph {
+        #[command(subcommand)]
+        action: GraphAction,
     },
     /// Generate `bonsai.toml` by auto-deriving the directory capability tree.
     Init {
@@ -248,6 +292,7 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Blueprint { action } => cmd_blueprint(action),
+        Cmd::Graph { action } => cmd_graph(action),
         Cmd::Init { root, force, skip } => cmd_init(&root, force, &skip),
         Cmd::Tree { root, files, depth } => cmd_tree(&root, files, depth),
         Cmd::Stat { root, top } => cmd_stat(&root, top),
@@ -408,6 +453,68 @@ fn cmd_blueprint(action: BlueprintAction) -> Result<()> {
                     .with_context(|| format!("writing scaffold {}", path.display()))?;
                 println!("created {}", path.display());
             }
+        }
+    }
+    Ok(())
+}
+
+fn open_fact_store(path: &Path) -> Result<SqliteFactStore> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating fact database directory {}", parent.display()))?;
+    }
+    SqliteFactStore::open(path).with_context(|| format!("opening fact database {}", path.display()))
+}
+
+fn cmd_graph(action: GraphAction) -> Result<()> {
+    match action {
+        GraphAction::Snapshot {
+            db,
+            blueprint,
+            parent,
+            reference,
+        } => {
+            let store = open_fact_store(&db)?;
+            let parent_id = parent
+                .as_deref()
+                .map(|value| store.resolve_snapshot(value))
+                .transpose()?;
+            let mut facts = Vec::new();
+            for path in blueprint {
+                let value = load_blueprint(&path)?;
+                require_valid(&value)?;
+                facts.extend(facts_from_blueprint(&value, &path.to_string_lossy()));
+            }
+            let snapshot = store.create_snapshot(parent_id.as_deref(), &facts)?;
+            store.set_ref(&reference, &snapshot.id)?;
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        GraphAction::Query { db, snapshot, bql } => {
+            let store = open_fact_store(&db)?;
+            let snapshot = store.resolve_snapshot(&snapshot)?;
+            let query = BqlQuery::parse(&bql)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.query(&snapshot, &query)?)?
+            );
+        }
+        GraphAction::Export { db, snapshot } => {
+            let store = open_fact_store(&db)?;
+            let snapshot = store.resolve_snapshot(&snapshot)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.facts(&snapshot)?)?
+            );
+        }
+        GraphAction::Graphql { db, query } => {
+            let store = open_fact_store(&db)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&bonsai::graphql::execute_query(store, &query))?
+            );
         }
     }
     Ok(())
