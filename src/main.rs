@@ -628,8 +628,12 @@ fn lean_findings(
     r: &bonsai::lean::LeanReport,
     near: &[bonsai::lean::NearDup],
     graph: Option<&bonsai::scip::CodeGraph>,
+    ws: Option<&Workspace>,
 ) -> Vec<Finding> {
     let mut out = Vec::new();
+    if let Some(ws) = ws {
+        out.extend(bonsai::forgotten::evaluate(ws)); // unwired + undocumented ("nothing forgotten")
+    }
     for g in &r.dup_groups {
         let related = g.files[1..].iter().map(Location::file).collect();
         out.push(
@@ -741,9 +745,15 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
         r.deferred
             .retain(|d| !d.starts_with("dead-code") && !d.starts_with("misplacement"));
     }
+    // the "forgotten" fold reads the .rs sources (unwired modules + undocumented pub API)
+    let ws = Workspace::from_dir(root).ok();
+    let forgotten = ws
+        .as_ref()
+        .map(bonsai::forgotten::evaluate)
+        .unwrap_or_default();
 
     if format != Format::Text {
-        let report = Report::new(lean_findings(root, &r, &near, graph.as_ref()));
+        let report = Report::new(lean_findings(root, &r, &near, graph.as_ref(), ws.as_ref()));
         match format {
             Format::Json => println!("{}", report.to_json()),
             Format::Sarif => println!("{}", report.to_sarif()),
@@ -776,6 +786,26 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
                 for scc in cyc.iter().take(4) {
                     println!("    ⟲ {}", scc.join(" → "));
                 }
+            }
+        }
+        let unwired = forgotten
+            .iter()
+            .filter(|f| f.rule == "forgotten-unwired")
+            .count();
+        let undoc = forgotten
+            .iter()
+            .filter(|f| f.rule == "forgotten-undoc")
+            .count();
+        if unwired > 0 || undoc > 0 {
+            println!(
+                "  forgotten      : {unwired} unwired module(s), {undoc} undocumented pub item(s)"
+            );
+            for f in forgotten
+                .iter()
+                .filter(|f| f.rule == "forgotten-unwired")
+                .take(6)
+            {
+                println!("    ⚠ {}", f.location.file);
             }
         }
         println!(

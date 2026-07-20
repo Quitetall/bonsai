@@ -17,6 +17,7 @@ pub mod config;
 pub mod contracts;
 pub mod ffi;
 pub mod finding;
+pub mod forgotten;
 pub mod lean;
 pub mod model;
 pub mod moves;

@@ -5,6 +5,14 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — nothing forgotten
+- **Forgotten-code fold** (`forgotten.rs`, surfaced by `lean`): **unwired modules** — a `.rs`
+  under `src/` that no `mod` declaration includes, so it isn't even compiled (the purest
+  "forgotten"); and **undocumented public API** — module-level `pub` items with no doc comment.
+  Source-based (works without a SCIP index), advisory (warning/info). Conservative: crate roots,
+  aggregators, and cargo-discovered trees (bin/examples/benches/tests) are never flagged, and a
+  module is only "unwired" when its name appears in no `mod` declaration at all.
+
 ### Added — structural health
 - **Dependency-cycle detection** (`CodeGraph::dependency_cycles`, iterative Tarjan SCC over the
   real `file_deps` graph): mutually-entangled module groups — the canonical structural-inefficiency
