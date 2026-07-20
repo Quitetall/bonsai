@@ -224,6 +224,14 @@ fn evolution_preserves_every_historical_permanent_port() {
     assert!(errors
         .iter()
         .any(|error| error.contains("permanent port 'raw'")));
+
+    let mut isolated = old.clone();
+    isolated.meta.id = "codec.lossless.v2".into();
+    isolated.meta.supersedes = Some(old.meta.id.clone());
+    isolated.implementations.clear();
+    assert!(Blueprint::validate_evolution(&old, &isolated)
+        .iter()
+        .any(|error| error.contains("no executable native or direct-adapter path")));
 }
 
 #[test]

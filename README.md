@@ -116,7 +116,9 @@ When a blueprint declares `supersedes`, the repository gate resolves both identi
 the new shape to retain every complete permanent-port contract from its predecessor. Because each
 generation carries the full historical set, this rule is transitive: arbitrarily old callers stay
 represented, and any conversion remains a direct adapter immediately below the stable boundary.
-Historical blueprint files must remain in `.bonsai/blueprints/`; a missing predecessor fails closed.
+Each retained port must also resolve to either a bound native implementation or a bound, witnessed
+direct adapter into an implemented current slot; an isolated legacy declaration fails. Historical
+blueprint files must remain in `.bonsai/blueprints/`; a missing predecessor fails closed.
 
 Scaffolding emits non-overwriting typed input/output envelopes, schema constants, implementation
 signatures, and contract-test surfaces for Rust, Python, C, and TypeScript. Payloads cross the

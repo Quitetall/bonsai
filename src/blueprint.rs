@@ -314,6 +314,12 @@ impl Blueprint {
             .map(|adapter| adapter.from.as_str())
             .collect();
         for adapter in &self.adapters {
+            if adapter.binding.trim().is_empty() {
+                errors.push(format!(
+                    "adapter '{}': implementation binding is empty",
+                    adapter.id
+                ));
+            }
             if !ports.contains_key(adapter.from.as_str()) {
                 errors.push(format!(
                     "adapter '{}': from port '{}' does not exist",
@@ -402,6 +408,32 @@ impl Blueprint {
                     "historical permanent port '{}' is missing; retain it so old callers remain supported",
                     historical.id
                 )),
+            }
+            let slot_is_executable = |slot: &str| {
+                new.implementations.iter().any(|implementation| {
+                    implementation.slots.iter().any(|item| item == slot)
+                        && !implementation.bindings.is_empty()
+                        && implementation
+                            .bindings
+                            .iter()
+                            .all(|binding| !binding.trim().is_empty())
+                })
+            };
+            let native = current_ports
+                .get(historical.id.as_str())
+                .is_some_and(|port| slot_is_executable(&port.slot));
+            let direct_adapter = new.adapters.iter().any(|adapter| {
+                adapter.from == historical.id
+                    && !adapter.binding.trim().is_empty()
+                    && current_ports
+                        .get(adapter.to.as_str())
+                        .is_some_and(|port| slot_is_executable(&port.slot))
+            });
+            if !native && !direct_adapter {
+                errors.push(format!(
+                    "historical permanent port '{}' has no executable native or direct-adapter path into the new shape",
+                    historical.id
+                ));
             }
         }
         errors.sort();

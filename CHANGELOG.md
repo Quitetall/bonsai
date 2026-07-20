@@ -11,7 +11,8 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 - **Shape locks and semantic diffs** with content-stable BLAKE3 identities. Implementation changes
   remain within one identity; topology/schema/invariant changes require a new identity.
 - **Transitive evolution checks** that resolve `supersedes` identities and require every historical
-  permanent-port contract to remain represented in the new shape.
+  permanent-port contract to remain represented with an executable native or direct-adapter path
+  in the new shape.
 - **Typed contract scaffolding** for Rust, Python, C, and TypeScript, including schema constants,
   input/output envelopes, implementation signatures, and contract-test surfaces. Generation is
   non-overwriting.
