@@ -228,9 +228,11 @@ fn cmd_hook(root: &Path, action: HookAction) -> Result<()> {
     };
     match action {
         HookAction::Install => {
-            // the bonsai-managed block, appended verbatim (idempotent via HOOK_MARK).
+            // the bonsai-managed block, appended verbatim (idempotent via HOOK_MARK). Guarded by
+            // `command -v bonsai` so a contributor without bonsai installed isn't blocked — they're
+            // covered by CI; the local hook is the fast guard for those who have it.
             let block = format!(
-                "\n{HOOK_MARK}\n# Blocks a commit that regresses structure, leanness, or a level contract.\n# --staged scopes file-level findings to the addition; repo-wide gates still apply.\nbonsai check --staged --root \"$(git rev-parse --show-toplevel)\" || exit 1\n"
+                "\n{HOOK_MARK}\n# Blocks a commit that regresses structure, leanness, or a level contract.\n# --staged scopes file-level findings to the addition; repo-wide gates still apply.\nif command -v bonsai >/dev/null 2>&1; then\n    bonsai check --staged --root \"$(git rev-parse --show-toplevel)\" || exit 1\nfi\n"
             );
             if hook.exists() && is_ours(&hook) {
                 println!("bonsai hook: already installed at {}", hook.display());
