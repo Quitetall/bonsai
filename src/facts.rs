@@ -324,3 +324,53 @@ pub fn facts_from_blueprint(blueprint: &Blueprint, locator: &str) -> Vec<Fact> {
     facts.dedup();
     facts
 }
+
+pub fn facts_from_scip(graph: &crate::scip::CodeGraph, locator: &str, digest: &str) -> Vec<Fact> {
+    let source = SourceRef {
+        adapter: "scip".into(),
+        locator: locator.into(),
+        digest: digest.into(),
+    };
+    let symbol_id = |id: &str| format!("scip:symbol/{id}");
+    let file_id = |id: &str| format!("scip:file/{id}");
+    let mut facts = Vec::new();
+    for (id, symbol) in &graph.symbols {
+        let mut attributes = BTreeMap::new();
+        attributes.insert("display".into(), symbol.display.clone());
+        attributes.insert("kind".into(), symbol.kind.to_string());
+        attributes.insert("line".into(), (symbol.def.sl + 1).to_string());
+        attributes.insert("implementation".into(), symbol.is_impl.to_string());
+        facts.push(Fact {
+            subject: symbol_id(id),
+            predicate: "defined-in".into(),
+            object: FactObject::Entity(file_id(&symbol.file)),
+            attributes,
+            source: source.clone(),
+        });
+    }
+    for (from, targets) in &graph.refs {
+        for target in targets {
+            facts.push(Fact {
+                subject: symbol_id(from),
+                predicate: "depends-on".into(),
+                object: FactObject::Entity(symbol_id(target)),
+                attributes: BTreeMap::new(),
+                source: source.clone(),
+            });
+        }
+    }
+    for (from, targets) in &graph.file_deps {
+        for target in targets {
+            facts.push(Fact {
+                subject: file_id(from),
+                predicate: "depends-on".into(),
+                object: FactObject::Entity(file_id(target)),
+                attributes: BTreeMap::new(),
+                source: source.clone(),
+            });
+        }
+    }
+    facts.sort();
+    facts.dedup();
+    facts
+}

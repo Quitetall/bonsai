@@ -7,7 +7,7 @@ use bonsai::blueprint::{
     Blueprint, BlueprintLock, Lifecycle, ScaffoldLanguage, ShapeDiff, WitnessResult,
 };
 use bonsai::config::Config;
-use bonsai::facts::{facts_from_blueprint, BqlQuery, FactStore, SqliteFactStore};
+use bonsai::facts::{facts_from_blueprint, facts_from_scip, BqlQuery, FactStore, SqliteFactStore};
 use bonsai::finding::{Finding, Location, Report, Severity};
 use bonsai::model::{Kind, NodeId, Plane};
 use bonsai::moves::{plan_move, Edit, Move, MovePlan, Workspace};
@@ -106,8 +106,11 @@ enum GraphAction {
     Snapshot {
         #[arg(long, default_value = ".bonsai/facts.db")]
         db: PathBuf,
-        #[arg(long, required = true)]
+        #[arg(long)]
         blueprint: Vec<PathBuf>,
+        /// SCIP compiler index to normalize into symbol and file dependency facts (repeatable).
+        #[arg(long)]
+        scip: Vec<PathBuf>,
         #[arg(long)]
         parent: Option<String>,
         #[arg(long = "ref", default_value = "main")]
@@ -474,9 +477,14 @@ fn cmd_graph(action: GraphAction) -> Result<()> {
         GraphAction::Snapshot {
             db,
             blueprint,
+            scip,
             parent,
             reference,
         } => {
+            anyhow::ensure!(
+                !blueprint.is_empty() || !scip.is_empty(),
+                "graph snapshot needs at least one --blueprint or --scip input"
+            );
             let store = open_fact_store(&db)?;
             let parent_id = parent
                 .as_deref()
@@ -487,6 +495,14 @@ fn cmd_graph(action: GraphAction) -> Result<()> {
                 let value = load_blueprint(&path)?;
                 require_valid(&value)?;
                 facts.extend(facts_from_blueprint(&value, &path.to_string_lossy()));
+            }
+            for path in scip {
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("reading SCIP index {}", path.display()))?;
+                let digest = format!("b3:{}", blake3::hash(&bytes).to_hex());
+                let graph = bonsai::scip::CodeGraph::from_file(&path)
+                    .with_context(|| format!("parsing SCIP index {}", path.display()))?;
+                facts.extend(facts_from_scip(&graph, &path.to_string_lossy(), &digest));
             }
             let snapshot = store.create_snapshot(parent_id.as_deref(), &facts)?;
             store.set_ref(&reference, &snapshot.id)?;

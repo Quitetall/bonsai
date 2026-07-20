@@ -1,7 +1,9 @@
 use bonsai::blueprint::Blueprint;
 use bonsai::facts::{
-    facts_from_blueprint, BqlQuery, Fact, FactObject, FactStore, SourceRef, SqliteFactStore,
+    facts_from_blueprint, facts_from_scip, BqlQuery, Fact, FactObject, FactStore, SourceRef,
+    SqliteFactStore,
 };
+use bonsai::scip::{CodeGraph, Range, Sym};
 
 fn edge(subject: &str, predicate: &str, object: &str) -> Fact {
     Fact {
@@ -120,4 +122,73 @@ fn mutable_refs_point_to_immutable_snapshots() {
     store.set_ref("main", &snapshot.id).unwrap();
     assert_eq!(store.resolve_snapshot("main").unwrap(), snapshot.id);
     assert_eq!(store.resolve_snapshot(&snapshot.id).unwrap(), snapshot.id);
+}
+
+#[test]
+fn scip_adapter_normalizes_symbol_and_file_dependencies() {
+    let mut graph = CodeGraph::default();
+    graph.symbols.insert(
+        "sym:api".into(),
+        Sym {
+            display: "api".into(),
+            kind: 17,
+            file: "src/api.rs".into(),
+            def: Range {
+                sl: 1,
+                sc: 0,
+                el: 1,
+                ec: 8,
+            },
+            enclosing: Range {
+                sl: 1,
+                sc: 0,
+                el: 3,
+                ec: 1,
+            },
+            is_impl: false,
+        },
+    );
+    graph.symbols.insert(
+        "sym:db".into(),
+        Sym {
+            display: "db".into(),
+            kind: 17,
+            file: "src/db.rs".into(),
+            def: Range {
+                sl: 1,
+                sc: 0,
+                el: 1,
+                ec: 7,
+            },
+            enclosing: Range {
+                sl: 1,
+                sc: 0,
+                el: 3,
+                ec: 1,
+            },
+            is_impl: false,
+        },
+    );
+    graph
+        .refs
+        .entry("sym:api".into())
+        .or_default()
+        .insert("sym:db".into());
+    graph
+        .file_deps
+        .entry("src/api.rs".into())
+        .or_default()
+        .insert("src/db.rs".into());
+
+    let facts = facts_from_scip(&graph, "index.scip", "b3:index");
+    assert!(facts.iter().any(|fact| {
+        fact.subject == "scip:symbol/sym:api"
+            && fact.predicate == "depends-on"
+            && fact.object == FactObject::Entity("scip:symbol/sym:db".into())
+    }));
+    assert!(facts.iter().any(|fact| {
+        fact.subject == "scip:file/src/api.rs"
+            && fact.predicate == "depends-on"
+            && fact.object == FactObject::Entity("scip:file/src/db.rs".into())
+    }));
 }
