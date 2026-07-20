@@ -478,7 +478,7 @@ fn open_fact_store(path: &Path) -> Result<SqliteFactStore> {
 }
 
 fn rooted(root: &Path, path: PathBuf) -> PathBuf {
-    if path.is_absolute() {
+    if path.is_absolute() || path.starts_with(root) {
         path
     } else {
         root.join(path)
@@ -552,7 +552,8 @@ fn cmd_graph(root: &Path, action: GraphAction) -> Result<()> {
                 let path = rooted(root, path);
                 let value = load_blueprint(&path)?;
                 require_valid(&value)?;
-                facts.extend(facts_from_blueprint(&value, &path.to_string_lossy()));
+                let locator = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+                facts.extend(facts_from_blueprint(&value, &locator));
             }
             for path in scip {
                 let path = rooted(root, path);
@@ -561,7 +562,8 @@ fn cmd_graph(root: &Path, action: GraphAction) -> Result<()> {
                 let digest = format!("b3:{}", blake3::hash(&bytes).to_hex());
                 let graph = bonsai::scip::CodeGraph::from_file(&path)
                     .with_context(|| format!("parsing SCIP index {}", path.display()))?;
-                facts.extend(facts_from_scip(&graph, &path.to_string_lossy(), &digest));
+                let locator = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+                facts.extend(facts_from_scip(&graph, &locator, &digest));
             }
             let snapshot = store.create_snapshot(parent_id.as_deref(), &facts)?;
             store.set_ref(&reference, &snapshot.id)?;
