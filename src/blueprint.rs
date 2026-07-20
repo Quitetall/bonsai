@@ -597,7 +597,7 @@ pub struct BlueprintLock {
     pub blueprint_id: String,
     pub shape_digest: String,
     pub permanent_ports: Vec<String>,
-    pub witnesses: Vec<String>,
+    pub witnesses: Vec<Witness>,
 }
 
 impl BlueprintLock {
@@ -634,10 +634,10 @@ impl BlueprintLock {
             .map(|port| port.id.clone())
             .collect();
         permanent_ports.sort();
-        let mut witnesses: Vec<String> = blueprint.witnesses.iter().map(|w| w.id.clone()).collect();
-        witnesses.sort();
+        let mut witnesses = blueprint.witnesses.clone();
+        witnesses.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
             blueprint_id: blueprint.meta.id.clone(),
             shape_digest: blueprint.shape_digest(),
             permanent_ports,
@@ -647,6 +647,12 @@ impl BlueprintLock {
 
     pub fn check(&self, blueprint: &Blueprint) -> Vec<String> {
         let mut errors = blueprint.validate();
+        if self.schema_version != 2 {
+            errors.push(format!(
+                "unsupported blueprint lock schema {}; recreate the lock with this Bonsai version",
+                self.schema_version
+            ));
+        }
         if self.blueprint_id != blueprint.meta.id {
             errors.push(format!(
                 "lock belongs to '{}' not '{}'",
@@ -670,10 +676,10 @@ impl BlueprintLock {
         if permanent != self.permanent_ports {
             errors.push("permanent port set changed".into());
         }
-        let mut witnesses: Vec<String> = blueprint.witnesses.iter().map(|w| w.id.clone()).collect();
-        witnesses.sort();
+        let mut witnesses = blueprint.witnesses.clone();
+        witnesses.sort_by(|left, right| left.id.cmp(&right.id));
         if witnesses != self.witnesses {
-            errors.push("witness set changed".into());
+            errors.push("witness contract changed".into());
         }
         errors.sort();
         errors.dedup();

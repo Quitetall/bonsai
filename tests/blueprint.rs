@@ -198,5 +198,12 @@ fn lock_detects_changed_witness_contract() {
     assert!(lock
         .check(&blueprint)
         .iter()
-        .any(|error| error.contains("witness set changed")));
+        .any(|error| error.contains("witness contract changed")));
+
+    let mut same_ids = Blueprint::from_toml(CODEC).unwrap();
+    same_ids.witnesses[0].command = "true".into();
+    assert!(lock
+        .check(&same_ids)
+        .iter()
+        .any(|error| error.contains("witness contract changed")));
 }

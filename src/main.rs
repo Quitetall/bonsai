@@ -1379,13 +1379,30 @@ fn check_blueprint_locks(root: &Path) -> Vec<Finding> {
             .and_then(|text| BlueprintLock::from_json(&text));
         match lock {
             Ok(lock) => {
-                for error in lock.check(&blueprint) {
+                let lock_errors = lock.check(&blueprint);
+                for error in &lock_errors {
                     findings.push(Finding::new(
                         "blueprint-lock",
                         Severity::Error,
-                        error,
+                        error.clone(),
                         Location::file(&relative),
                     ));
+                }
+                // Execute only the exact witness contract authorized by the lock. A changed
+                // command is rejected above before repository-authored shell is invoked.
+                if lock_errors.is_empty() {
+                    for result in blueprint
+                        .run_witnesses(root)
+                        .into_iter()
+                        .filter(|result| !result.passed)
+                    {
+                        findings.push(Finding::new(
+                            "blueprint-lock",
+                            Severity::Error,
+                            format!("witness '{}' failed: {}", result.id, result.detail),
+                            Location::file(&relative),
+                        ));
+                    }
                 }
             }
             Err(error) => findings.push(Finding::new(

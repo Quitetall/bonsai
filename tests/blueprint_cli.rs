@@ -113,6 +113,56 @@ fn validate_verify_lock_and_check_round_trip() {
 }
 
 #[test]
+fn repository_check_reruns_the_locked_witness_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    let conventional = dir.path().join(".bonsai/blueprints");
+    fs::create_dir_all(&conventional).unwrap();
+    let path = conventional.join("pipeline.toml");
+    let results = dir.path().join("results.json");
+    let lock = conventional.join("pipeline.lock.json");
+    fs::write(
+        &path,
+        blueprint("locked").replace("command = \"true\"", "command = \"touch witness-ran\""),
+    )
+    .unwrap();
+
+    assert!(bonsai()
+        .args(["blueprint", "verify"])
+        .arg(&path)
+        .args(["--root"])
+        .arg(dir.path())
+        .args(["--out"])
+        .arg(&results)
+        .status()
+        .unwrap()
+        .success());
+    assert!(bonsai()
+        .args(["blueprint", "lock"])
+        .arg(&path)
+        .args(["--results"])
+        .arg(&results)
+        .args(["--out"])
+        .arg(&lock)
+        .status()
+        .unwrap()
+        .success());
+    fs::remove_file(dir.path().join("witness-ran")).unwrap();
+    assert!(bonsai()
+        .args(["init", "--root"])
+        .arg(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(bonsai()
+        .args(["check", "--root"])
+        .arg(dir.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(dir.path().join("witness-ran").exists());
+}
+
+#[test]
 fn scaffold_emits_language_specific_contract_stubs_without_overwrite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pipeline.toml");

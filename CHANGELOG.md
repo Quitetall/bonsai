@@ -12,7 +12,8 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
   remain within one identity; topology/schema/invariant changes require a new identity.
 - **Contract scaffolding** for Rust, Python, C, and TypeScript. Generation is non-overwriting.
 - **Automatic admission-gate integration**: `bonsai check` discovers root and `.bonsai/blueprints/`
-  contracts, validates them, and fails on missing or drifting locks.
+  contracts, validates them, fails on missing or drifting locks, and reruns the exact witness
+  contract pinned into lock schema v2.
 - **Immutable typed fact snapshots** in bundled SQLite, source provenance, mutable refs over
   immutable history, bounded BQL dependency/impact traversal, and a read-only GraphQL projection.
 - **Katana integration** through brokered MCP tools, replay-recorded results, a native deterministic

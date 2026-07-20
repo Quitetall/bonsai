@@ -101,7 +101,9 @@ A locked blueprint is a change-control boundary, not a diagram. `bonsai blueprin
 freeze an invalid shape, a non-locked lifecycle, a missing witness, or a failed witness. The lock
 pins the canonical shape digest, permanent external ports, and witness set. The ordinary
 `bonsai check` command automatically discovers `bonsai.blueprint.toml` and
-`.bonsai/blueprints/*.toml`, so existing hooks and CI protect the new contract.
+`.bonsai/blueprints/*.toml`, so existing hooks and CI protect the new contract. For a locked
+blueprint, the lock pins each witness's kind, command, and coverage; `bonsai check` reruns that
+exact witness contract and fails closed on drift or a failing command.
 
 Permanent compatibility is expressed with versioned ports and direct, witnessed adapters. Bonsai
 rejects adapter chains: each supported old representation must adapt directly to the current
