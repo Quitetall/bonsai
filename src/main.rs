@@ -228,20 +228,32 @@ fn cmd_hook(root: &Path, action: HookAction) -> Result<()> {
     };
     match action {
         HookAction::Install => {
-            if hook.exists() && !is_ours(&hook) {
-                anyhow::bail!(
-                    "{} already exists and is not bonsai-managed — add `bonsai check` to it by \
-                     hand, or remove it first",
+            // the bonsai-managed block, appended verbatim (idempotent via HOOK_MARK).
+            let block = format!(
+                "\n{HOOK_MARK}\n# Blocks a commit that regresses structure, leanness, or a level contract.\n# --staged scopes file-level findings to the addition; repo-wide gates still apply.\nbonsai check --staged --root \"$(git rev-parse --show-toplevel)\" || exit 1\n"
+            );
+            if hook.exists() && is_ours(&hook) {
+                println!("bonsai hook: already installed at {}", hook.display());
+            } else if hook.exists() {
+                // COMPOSE into an existing (non-bonsai) hook — don't clobber the contributor's.
+                let mut existing = std::fs::read_to_string(&hook).unwrap_or_default();
+                if !existing.ends_with('\n') {
+                    existing.push('\n');
+                }
+                std::fs::write(&hook, format!("{existing}{block}"))
+                    .with_context(|| format!("appending to {}", hook.display()))?;
+                set_executable(&hook)?;
+                println!(
+                    "bonsai hook: appended the gate to your existing {}",
                     hook.display()
                 );
+            } else {
+                std::fs::write(&hook, format!("#!/bin/sh{block}"))
+                    .with_context(|| format!("writing {}", hook.display()))?;
+                set_executable(&hook)?;
+                println!("bonsai hook: installed → {}", hook.display());
             }
-            let script = format!(
-                "#!/bin/sh\n{HOOK_MARK}\n# Blocks a commit that regresses structure, leanness, or a level contract.\n# --staged scopes file-level findings to the addition; repo-wide gates still apply.\nexec bonsai check --staged --root \"$(git rev-parse --show-toplevel)\"\n"
-            );
-            std::fs::write(&hook, script).with_context(|| format!("writing {}", hook.display()))?;
-            set_executable(&hook)?;
-            println!("bonsai hook: installed → {}", hook.display());
-            println!("  every commit now runs `bonsai check` (placement · layering · contracts · ratchet).");
+            println!("  every commit now runs `bonsai check --staged` (placement · layering · contracts · ratchet).");
         }
         HookAction::Status => {
             if hook.exists() && is_ours(&hook) {
@@ -256,12 +268,24 @@ fn cmd_hook(root: &Path, action: HookAction) -> Result<()> {
             }
         }
         HookAction::Uninstall => {
-            if hook.exists() && is_ours(&hook) {
-                std::fs::remove_file(&hook)
-                    .with_context(|| format!("removing {}", hook.display()))?;
-                println!("bonsai hook: removed {}", hook.display());
-            } else {
+            if !hook.exists() || !is_ours(&hook) {
                 println!("bonsai hook: nothing to remove (no bonsai-managed hook).");
+            } else {
+                let text = std::fs::read_to_string(&hook).unwrap_or_default();
+                if let Some(pos) = text.find(HOOK_MARK) {
+                    let head = text[..pos].trim_end();
+                    if head.is_empty() || head == "#!/bin/sh" {
+                        std::fs::remove_file(&hook)?; // the file was entirely ours
+                        println!("bonsai hook: removed {}", hook.display());
+                    } else {
+                        // strip only our appended block, keep the contributor's hook
+                        std::fs::write(&hook, format!("{head}\n"))?;
+                        println!(
+                            "bonsai hook: removed the bonsai block from {}",
+                            hook.display()
+                        );
+                    }
+                }
             }
         }
     }
@@ -762,7 +786,7 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
     // one parallel content pass feeds both the exact-dup report and near-duplicates.
     // (near-dup needs shingles, which need a read, so the cache warms but doesn't skip reads
     // here; it still refreshes so the next `check` is fast.)
-    let mut scfg = bonsai::scan::ScanConfig::with_shingles();
+    let mut scfg = bonsai::scan::ScanConfig::with_shingles().skipping(&cfg.bonsai.skip);
     if cache {
         scfg = scfg.with_cache(bonsai::scan::ScanConfig::default_cache_path(root));
     }
@@ -777,14 +801,15 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
         r.deferred
             .retain(|d| !d.starts_with("dead-code") && !d.starts_with("misplacement"));
     }
-    // the "forgotten" fold + function-clone detection read the .rs sources
-    let ws = Workspace::from_dir(root).ok();
+    // the "forgotten" fold + function-clone detection read the sources, honoring the skip list
+    // (so intentionally-redundant/kept trees don't pollute the report).
+    let ws = Workspace::from_dir_ext_skip(root, &["rs"], &cfg.bonsai.skip).ok();
     let forgotten = ws
         .as_ref()
         .map(bonsai::forgotten::evaluate)
         .unwrap_or_default();
     // clone detection spans Rust + Python (the polyglot "duplicated" signal); its own workspace.
-    let clones = Workspace::from_dir_ext(root, &["rs", "py"])
+    let clones = Workspace::from_dir_ext_skip(root, &["rs", "py"], &cfg.bonsai.skip)
         .ok()
         .map(|w| bonsai::clones::function_clones(&w, 6))
         .unwrap_or_default();
@@ -1002,8 +1027,9 @@ fn cmd_check(
         let baseline: bonsai::lean::LeanBaseline =
             serde_json::from_str(&std::fs::read_to_string(&baseline_path)?)
                 .with_context(|| format!("parsing {LEAN_BASELINE}"))?;
-        // the fast gate: hashes + line counts, incremental cache, no shingles
-        let mut scfg = bonsai::scan::ScanConfig::gate();
+        // the fast gate: hashes + line counts, incremental cache, no shingles; the config skip
+        // list excludes intentionally-redundant/kept trees (bench baselines, run logs, …).
+        let mut scfg = bonsai::scan::ScanConfig::gate().skipping(&cfg.bonsai.skip);
         if cache {
             scfg = scfg.with_cache(bonsai::scan::ScanConfig::default_cache_path(root));
         }
@@ -1029,7 +1055,7 @@ fn cmd_check(
     // 4. architecture contracts — force each level to fulfill its anchor, forbid escape hatches,
     //    and keep sealed seams frozen (reads the .rs sources once, only when contracts exist)
     if !cfg.contracts.is_empty() {
-        let ws = Workspace::from_dir(root)
+        let ws = Workspace::from_dir_ext_skip(root, &["rs"], &cfg.bonsai.skip)
             .with_context(|| format!("scanning sources at {}", root.display()))?;
         findings.extend(bonsai::contracts::evaluate(&ws, &cfg.contracts));
     }
