@@ -453,50 +453,171 @@ fn pascal(id: &str) -> String {
 }
 
 fn scaffold_slot(blueprint: &Blueprint, slot: &Slot, language: ScaffoldLanguage) -> ScaffoldFile {
-    let contracts = blueprint
+    let ports = blueprint
         .ports
         .iter()
         .filter(|port| port.slot == slot.id)
+        .collect::<Vec<_>>();
+    let contracts = ports
+        .iter()
         .map(|port| format!("{} {:?}: {}", port.id, port.direction, port.schema))
         .collect::<Vec<_>>()
         .join("\n");
+    let inputs = ports
+        .iter()
+        .copied()
+        .filter(|port| port.direction == Direction::Input)
+        .collect::<Vec<_>>();
+    let outputs = ports
+        .iter()
+        .copied()
+        .filter(|port| port.direction == Direction::Output)
+        .collect::<Vec<_>>();
     let name = pascal(&slot.id);
     let stem = snake(&slot.id);
     let (extension, content) = match language {
-        ScaffoldLanguage::Rust => (
-            "rs",
-            format!(
-                "//! Generated contract scaffold for slot `{}`.\n//! {}\n\npub trait {name} {{\n    /// Implement the locked port contract.\n    fn execute(&mut self) -> Result<(), Box<dyn std::error::Error>>;\n}}\n",
-                slot.id,
-                contracts.replace('\n', "\n//! ")
-            ),
-        ),
-        ScaffoldLanguage::Python => (
-            "py",
-            format!(
-                "\"\"\"Generated contract scaffold for slot `{}`.\n{}\n\"\"\"\nfrom abc import ABC, abstractmethod\n\n\nclass {name}(ABC):\n    @abstractmethod\n    def execute(self) -> None:\n        \"\"\"Implement the locked port contract.\"\"\"\n",
-                slot.id, contracts
-            ),
-        ),
-        ScaffoldLanguage::C => (
-            "h",
-            format!(
-                "/* Generated contract scaffold for slot `{}`.\n * {}\n */\n#ifndef BONSAI_{}_H\n#define BONSAI_{}_H\n\nint {}_execute(void *context);\n\n#endif\n",
-                slot.id,
-                contracts.replace('\n', "\n * "),
-                stem.to_ascii_uppercase(),
-                stem.to_ascii_uppercase(),
-                stem
-            ),
-        ),
-        ScaffoldLanguage::TypeScript => (
-            "ts",
-            format!(
-                "/** Generated contract scaffold for slot `{}`.\n * {}\n */\nexport interface {name} {{\n  execute(): Promise<void>;\n}}\n",
-                slot.id,
-                contracts.replace('\n', "\n * ")
-            ),
-        ),
+        ScaffoldLanguage::Rust => {
+            let rust_fields = |selected: &[&Port]| -> String {
+                if selected.is_empty() {
+                    "    // This side of the slot has no ports.\n".into()
+                } else {
+                    selected
+                        .iter()
+                        .map(|port| format!("    pub {}: Vec<u8>,\n", snake(&port.id)))
+                        .collect::<String>()
+                }
+            };
+            let schema_constants = ports
+                .iter()
+                .map(|port| {
+                    format!(
+                        "pub const {}_SCHEMA: &str = {};\n",
+                        snake(&port.id).to_ascii_uppercase(),
+                        serde_json::to_string(&port.schema).expect("schema is serializable")
+                    )
+                })
+                .collect::<String>();
+            let schemas = ports
+                .iter()
+                .map(|port| format!("{}_SCHEMA", snake(&port.id).to_ascii_uppercase()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                "rs",
+                format!(
+                    "//! Generated typed contract scaffold for slot `{}`.\n//! Port payloads are serialized bytes governed by the schema constants below.\n//! {}\n\n{schema_constants}\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct {name}Input {{\n{}}}\n\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct {name}Output {{\n{}}}\n\npub trait {name} {{\n    type Error;\n\n    fn execute(&mut self, input: {name}Input) -> Result<{name}Output, Self::Error>;\n}}\n\n#[cfg(test)]\nmod contract_tests {{\n    use super::*;\n\n    pub fn assert_implementation<T: {name}>() {{}}\n\n    #[test]\n    fn schema_contract_is_well_formed() {{\n        let schemas: &[&str] = &[{schemas}];\n        assert!(schemas.iter().all(|schema| !schema.is_empty()));\n    }}\n}}\n",
+                    slot.id,
+                    contracts.replace('\n', "\n//! "),
+                    rust_fields(&inputs),
+                    rust_fields(&outputs),
+                ),
+            )
+        }
+        ScaffoldLanguage::Python => {
+            let python_fields = |selected: &[&Port]| -> String {
+                if selected.is_empty() {
+                    "    pass\n".into()
+                } else {
+                    selected
+                        .iter()
+                        .map(|port| format!("    {}: bytes\n", snake(&port.id)))
+                        .collect::<String>()
+                }
+            };
+            let schema_constants = ports
+                .iter()
+                .map(|port| {
+                    format!(
+                        "{}_SCHEMA = {}\n",
+                        snake(&port.id).to_ascii_uppercase(),
+                        serde_json::to_string(&port.schema).expect("schema is serializable")
+                    )
+                })
+                .collect::<String>();
+            (
+                "py",
+                format!(
+                    "\"\"\"Generated typed contract scaffold for slot `{}`.\n{}\n\"\"\"\nfrom dataclasses import dataclass\nfrom typing import Protocol\n\n{schema_constants}\n@dataclass(frozen=True)\nclass {name}Input:\n{}\n@dataclass(frozen=True)\nclass {name}Output:\n{}\nclass {name}(Protocol):\n    def execute(self, input: {name}Input) -> {name}Output: ...\n\n\ndef test_schema_contract_is_well_formed() -> None:\n    assert all(({}))\n",
+                    slot.id,
+                    contracts,
+                    python_fields(&inputs),
+                    python_fields(&outputs),
+                    ports
+                        .iter()
+                        .map(|port| snake(&port.id).to_ascii_uppercase() + "_SCHEMA")
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        }
+        ScaffoldLanguage::C => {
+            let c_fields = |selected: &[&Port]| -> String {
+                if selected.is_empty() {
+                    "    unsigned char _unused;\n".into()
+                } else {
+                    selected
+                        .iter()
+                        .map(|port| {
+                            format!(
+                                "    const unsigned char *{}_data;\n    size_t {}_len;\n",
+                                snake(&port.id),
+                                snake(&port.id)
+                            )
+                        })
+                        .collect::<String>()
+                }
+            };
+            let upper = stem.to_ascii_uppercase();
+            let schema_constants = ports
+                .iter()
+                .map(|port| {
+                    format!(
+                        "#define BONSAI_{}_{}_SCHEMA {}\n",
+                        upper,
+                        snake(&port.id).to_ascii_uppercase(),
+                        serde_json::to_string(&port.schema).expect("schema is serializable")
+                    )
+                })
+                .collect::<String>();
+            (
+                "h",
+                format!(
+                    "/* Generated typed contract scaffold for slot `{}`.\n * {}\n */\n#ifndef BONSAI_{upper}_H\n#define BONSAI_{upper}_H\n#include <stddef.h>\n\n{schema_constants}\ntypedef struct {{\n{}}} {stem}_input;\n\ntypedef struct {{\n{}}} {stem}_output;\n\nint {stem}_execute(void *context, const {stem}_input *input, {stem}_output *output);\n\n#endif\n",
+                    slot.id,
+                    contracts.replace('\n', "\n * "),
+                    c_fields(&inputs),
+                    c_fields(&outputs)
+                ),
+            )
+        }
+        ScaffoldLanguage::TypeScript => {
+            let ts_fields = |selected: &[&Port]| {
+                selected
+                    .iter()
+                    .map(|port| format!("  {}: Uint8Array;\n", snake(&port.id)))
+                    .collect::<String>()
+            };
+            let schema_constants = ports
+                .iter()
+                .map(|port| {
+                    format!(
+                        "export const {}_SCHEMA = {} as const;\n",
+                        snake(&port.id).to_ascii_uppercase(),
+                        serde_json::to_string(&port.schema).expect("schema is serializable")
+                    )
+                })
+                .collect::<String>();
+            (
+                "ts",
+                format!(
+                    "/** Generated typed contract scaffold for slot `{}`.\n * {}\n */\n{schema_constants}\nexport interface {name}Input {{\n{}}}\n\nexport interface {name}Output {{\n{}}}\n\nexport interface {name} {{\n  execute(input: {name}Input): Promise<{name}Output>;\n}}\n",
+                    slot.id,
+                    contracts.replace('\n', "\n * "),
+                    ts_fields(&inputs),
+                    ts_fields(&outputs)
+                ),
+            )
+        }
     };
     ScaffoldFile {
         relative_path: format!("{stem}.{extension}"),

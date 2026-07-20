@@ -111,9 +111,11 @@ boundary, keeping compatibility cost visible and preventing a fragile tower of h
 Multi-slot fused implementations require every slot to opt in and a differential witness covering
 the complete fused region.
 
-Scaffolding currently emits non-overwriting contract stubs for Rust, Python, C, and TypeScript.
-Generated stubs are a starting seam, never a source of authority; authored schemas, witnesses, and
-the lock remain authoritative.
+Scaffolding emits non-overwriting typed input/output envelopes, schema constants, implementation
+signatures, and contract-test surfaces for Rust, Python, C, and TypeScript. Payloads cross the
+generated seam as schema-governed bytes so repositories can bind their own generated or native
+types without making Bonsai a schema compiler. Generated files are a starting seam, never a source
+of authority; authored schemas, witnesses, and the lock remain authoritative.
 
 ## Digital twin and query APIs
 

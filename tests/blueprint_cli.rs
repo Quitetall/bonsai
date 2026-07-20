@@ -178,10 +178,60 @@ fn scaffold_emits_language_specific_contract_stubs_without_overwrite() {
     assert!(command.status().unwrap().success());
     let ingest = fs::read_to_string(out.join("ingest.rs")).unwrap();
     assert!(ingest.contains("pub trait Ingest"));
+    assert!(ingest.contains("pub struct IngestInput"));
+    assert!(ingest.contains("pub bytes: Vec<u8>"));
+    assert!(ingest.contains("pub struct IngestOutput"));
+    assert!(ingest.contains("pub records: Vec<u8>"));
+    assert!(ingest.contains("fn execute(&mut self, input: IngestInput)"));
+    assert!(ingest.contains("fn schema_contract_is_well_formed()"));
     assert!(ingest.contains("example.Bytes/v1"));
 
     assert!(
         !command.status().unwrap().success(),
         "must not overwrite authored code"
     );
+
+    for (language, file, expected) in [
+        (
+            "python",
+            "ingest.py",
+            &[
+                "class IngestInput",
+                "bytes: bytes",
+                "def execute(self, input:",
+            ][..],
+        ),
+        (
+            "c",
+            "ingest.h",
+            &[
+                "typedef struct",
+                "bytes_data",
+                "ingest_execute(void *context, const ingest_input *input",
+            ][..],
+        ),
+        (
+            "type-script",
+            "ingest.ts",
+            &[
+                "interface IngestInput",
+                "bytes: Uint8Array",
+                "execute(input: IngestInput)",
+            ][..],
+        ),
+    ] {
+        let language_out = out.join(language);
+        assert!(bonsai()
+            .args(["blueprint", "scaffold"])
+            .arg(&path)
+            .args(["--language", language, "--out"])
+            .arg(&language_out)
+            .status()
+            .unwrap()
+            .success());
+        let generated = fs::read_to_string(language_out.join(file)).unwrap();
+        for needle in expected {
+            assert!(generated.contains(needle), "{language} omitted {needle}");
+        }
+    }
 }
