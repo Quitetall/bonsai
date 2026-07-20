@@ -12,6 +12,7 @@ use crate::model::Kind;
 use crate::scip::CodeGraph;
 use crate::tree::Tree;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Evaluate every declared rule over the tree (structure) + optional SCIP graph (coupling),
 /// returning error-severity findings — empty means the addition is conformant.
@@ -118,6 +119,73 @@ pub fn apply_allow(findings: Vec<Finding>, allow: &[String]) -> (Vec<Finding>, V
         }
     }
     (kept, exempted)
+}
+
+/// **Inline suppression** — the line-level FP valve. A finding is dropped when its own line (or
+/// the line just above it) carries a `// bonsai:allow` marker: `// bonsai:allow` suppresses any
+/// rule there, `// bonsai:allow(dead-code)` suppresses one rule (or a `foo` family for `foo-*`),
+/// `// bonsai:allow(a, b)` a set. This lets a dev waive a genuine false positive right at the
+/// source (ideally with a trailing reason) instead of fighting the gate or editing bonsai.toml.
+/// Reads each cited file once (cached); findings without a line, or in unreadable files, pass
+/// through. Returns `(kept, suppressed_count)`.
+pub fn apply_inline_suppression(root: &Path, findings: Vec<Finding>) -> (Vec<Finding>, usize) {
+    let mut cache: BTreeMap<String, Option<Vec<String>>> = BTreeMap::new();
+    let mut kept = Vec::new();
+    let mut suppressed = 0usize;
+    for f in findings {
+        let Some(line) = f.location.line else {
+            kept.push(f);
+            continue;
+        };
+        let lines = cache.entry(f.location.file.clone()).or_insert_with(|| {
+            std::fs::read_to_string(root.join(&f.location.file))
+                .ok()
+                .map(|t| t.lines().map(String::from).collect())
+        });
+        let hit = lines
+            .as_ref()
+            .map(|ls| line_suppresses(ls, line as usize, &f.rule))
+            .unwrap_or(false);
+        if hit {
+            suppressed += 1;
+        } else {
+            kept.push(f);
+        }
+    }
+    (kept, suppressed)
+}
+
+/// Does the 1-indexed `line` (or the line above it) carry a `// bonsai:allow` marker for `rule`?
+fn line_suppresses(lines: &[String], line: usize, rule: &str) -> bool {
+    for probe in [line, line.saturating_sub(1)] {
+        if probe == 0 {
+            continue;
+        }
+        if let Some(text) = lines.get(probe - 1) {
+            if let Some(spec) = parse_allow_comment(text) {
+                let s = spec.trim();
+                if s.is_empty()
+                    || s.split(',').any(|r| {
+                        let r = r.trim();
+                        r == rule || rule.starts_with(&format!("{r}-"))
+                    })
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract the rule spec from a `bonsai:allow[(...)]` comment: `Some("")` for the bare marker,
+/// `Some("dead-code")` / `Some("a, b")` for a parenthesized spec, `None` if the marker is absent.
+fn parse_allow_comment(line: &str) -> Option<&str> {
+    let after = &line[line.find("bonsai:allow")? + "bonsai:allow".len()..];
+    match after.strip_prefix('(') {
+        Some(rest) => rest.split_once(')').map(|(inside, _)| inside),
+        None => Some(""),
+    }
 }
 
 fn matches_allow(f: &Finding, entry: &str) -> bool {
@@ -396,6 +464,50 @@ facets = { layer = "cli" }
             g.iter().any(|x| x.rule == "abstraction-depth"),
             "deep tree > max_depth 1 must flag: {g:?}"
         );
+    }
+
+    #[test]
+    fn inline_suppression_waives_by_line_and_rule() {
+        let dir = std::env::temp_dir().join("bonsai_inline_supp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn ok() {}\nfn dead1() {} // bonsai:allow(dead-code)\n// bonsai:allow\nfn dead2() {}\nfn dead3() {}\n",
+        )
+        .unwrap();
+        let findings = vec![
+            // line 2: same-line waiver naming dead-code → suppressed
+            Finding::new("dead-code", Severity::Warning, "x", Location::at("a.rs", 2)),
+            // line 4: waiver on the line above (bare) → suppressed
+            Finding::new("dead-code", Severity::Warning, "x", Location::at("a.rs", 4)),
+            // line 5: no waiver → kept
+            Finding::new("dead-code", Severity::Warning, "x", Location::at("a.rs", 5)),
+        ];
+        let (kept, n) = apply_inline_suppression(&dir, findings);
+        assert_eq!(n, 2, "two waived");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].location.line, Some(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_suppression_respects_rule_specificity() {
+        let dir = std::env::temp_dir().join("bonsai_inline_spec");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // waiver names a DIFFERENT rule → the finding is NOT suppressed
+        std::fs::write(dir.join("b.rs"), "fn f() {} // bonsai:allow(duplicate)\n").unwrap();
+        let findings = vec![Finding::new(
+            "dead-code",
+            Severity::Warning,
+            "x",
+            Location::at("b.rs", 1),
+        )];
+        let (kept, n) = apply_inline_suppression(&dir, findings);
+        assert_eq!(n, 0, "different rule not waived");
+        assert_eq!(kept.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

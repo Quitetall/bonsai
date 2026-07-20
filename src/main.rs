@@ -933,6 +933,10 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
         Vec::new()
     };
 
+    // 6. inline `// bonsai:allow` — the line-level valve for a genuine false positive at source.
+    let (kept, suppressed) = bonsai::rules::apply_inline_suppression(root, findings);
+    findings = kept;
+
     let report = Report::new(findings);
 
     // Machine formats: emit the finding stream, then fail closed if any error exists
@@ -958,6 +962,9 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
         for f in exempted.iter().take(8) {
             println!("      [{}] {}", f.rule, f.location.file);
         }
+    }
+    if suppressed > 0 {
+        println!("  ⓘ {suppressed} finding(s) waived inline (// bonsai:allow)");
     }
 
     // Warnings (e.g. premature-abstraction) are reported but do NOT fail the gate — only

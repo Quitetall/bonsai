@@ -5,6 +5,16 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — false-positive reduction (trust)
+- **Inline `// bonsai:allow` suppression** — the line-level FP valve: a finding is waived when its
+  own line or the line above carries `// bonsai:allow` (any rule), `// bonsai:allow(dead-code)`
+  (one rule / a `foo-*` family), or `// bonsai:allow(a, b)` (a set). `check` reports how many were
+  waived (never silent). Lets a dev clear a genuine false positive at the source instead of
+  fighting the gate.
+- **Cross-file contract anchors** — a triggered file satisfies its `must_impl` anchor when the
+  `impl` lives in *any* file under the level's path (against a `pub` type the file defines), not
+  only the same file — eliminating the most common contract false positive.
+
 ### Added — nothing forgotten
 - **Forgotten-code fold** (`forgotten.rs`, surfaced by `lean`): **unwired modules** — a `.rs`
   under `src/` that no `mod` declaration includes, so it isn't even compiled (the purest

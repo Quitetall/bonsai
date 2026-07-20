@@ -37,7 +37,7 @@ pub fn evaluate(ws: &Workspace, contracts: &[Contract]) -> Vec<Finding> {
             if !rel.starts_with(&c.path) {
                 continue;
             }
-            anchor(c, level, &rel, text, &mut out);
+            anchor(c, level, &rel, text, ws, &mut out);
             forbidden(c, level, &rel, text, &mut out);
         }
         sealed(ws, c, level, &mut out);
@@ -45,15 +45,24 @@ pub fn evaluate(ws: &Workspace, contracts: &[Contract]) -> Vec<Finding> {
     out
 }
 
-/// grow-through-anchor-traits: a triggered file must implement the anchor trait.
-fn anchor(c: &Contract, level: &str, rel: &str, text: &str, out: &mut Vec<Finding>) {
+/// grow-through-anchor-traits: a triggered file must implement the anchor trait. The `impl` may
+/// live in the *same* file, or — the common real case a same-file check would false-positive on —
+/// in any other file under the level's path, against a `pub` type this file defines.
+fn anchor(
+    c: &Contract,
+    level: &str,
+    rel: &str,
+    text: &str,
+    ws: &Workspace,
+    out: &mut Vec<Finding>,
+) {
     let Some(tr) = &c.must_impl else { return };
     // trigger: an explicit marker, or (absent) every file under the path.
     let triggered = match &c.when_defines {
         Some(marker) => text.contains(marker),
         None => true,
     };
-    if triggered && !implements(text, tr) {
+    if triggered && !implements(text, tr) && !impl_under_path(ws, c, tr, text) {
         let because = c
             .when_defines
             .as_deref()
@@ -179,6 +188,60 @@ fn implements(text: &str, tr: &str) -> bool {
     text.lines().any(|l| impl_line_for(l, tr))
 }
 
+/// True if some file under the contract's path implements `tr` for a `pub` type that the
+/// triggered file (`text`) defines — i.e. the anchor is satisfied cross-file, not just in-file.
+fn impl_under_path(ws: &Workspace, c: &Contract, tr: &str, text: &str) -> bool {
+    let types = pub_types(text);
+    if types.is_empty() {
+        return false;
+    }
+    ws.files.iter().any(|(p, t)| {
+        p.to_string_lossy().starts_with(&c.path) && types.iter().any(|ty| impl_for_type(t, tr, ty))
+    })
+}
+
+/// The `pub struct`/`pub enum` type names defined in `text` (candidates for a trait impl).
+fn pub_types(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let t = l.trim_start().trim_start_matches("pub").trim_start();
+            for kw in ["struct ", "enum "] {
+                if let Some(rest) = t.strip_prefix(kw) {
+                    let id: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !id.is_empty() {
+                        return Some(id);
+                    }
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+/// True if `text` has an `impl <tr> for <ty>` line (with a type-name word boundary after `ty`).
+fn impl_for_type(text: &str, tr: &str, ty: &str) -> bool {
+    text.lines().any(|l| {
+        if !impl_line_for(l, tr) {
+            return false;
+        }
+        match l.find(" for ") {
+            Some(pos) => {
+                let after = l[pos + 5..].trim_start();
+                after.starts_with(ty)
+                    && !after[ty.len()..]
+                        .chars()
+                        .next()
+                        .map(|ch| ch.is_alphanumeric() || ch == '_')
+                        .unwrap_or(false)
+            }
+            None => false,
+        }
+    })
+}
+
 /// True if `text` defines a `trait`/`struct`/`enum`/`type` named exactly `name`.
 fn defines_type(text: &str, name: &str) -> bool {
     text.lines().any(|l| {
@@ -256,6 +319,25 @@ mod tests {
         assert!(
             !f.iter().any(|x| x.rule == "contract-anchor"),
             "impl present → OK: {f:?}"
+        );
+    }
+
+    #[test]
+    fn anchor_satisfied_by_impl_in_another_file_under_path() {
+        // the wire format is declared in new_fmt.rs; its `impl Codec` lives in codec_impls.rs —
+        // a same-file check would false-positive, the path-wide check must not.
+        let ws = Workspace::from_pairs(
+            ".",
+            [
+                ("codec/src/trait.rs", "pub trait Codec {}\n"),
+                ("codec/src/new_fmt.rs", "// WireMagic\npub struct NewFmt;\n"),
+                ("codec/src/codec_impls.rs", "impl Codec for NewFmt {}\n"),
+            ],
+        );
+        let f = evaluate(&ws, &[contract()]);
+        assert!(
+            !f.iter().any(|x| x.rule == "contract-anchor"),
+            "impl in a sibling file under the path satisfies the anchor: {f:?}"
         );
     }
 
