@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Blueprint {
@@ -161,6 +163,20 @@ impl WitnessResult {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaffoldLanguage {
+    Rust,
+    Python,
+    C,
+    TypeScript,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScaffoldFile {
+    pub relative_path: String,
+    pub content: String,
+}
+
 impl Blueprint {
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(text)?)
@@ -201,6 +217,18 @@ impl Blueprint {
             self.witnesses.iter().map(|item| item.id.as_str()),
             &mut errors,
         );
+        for (kind, id) in self
+            .slots
+            .iter()
+            .map(|item| ("slot", item.id.as_str()))
+            .chain(self.ports.iter().map(|item| ("port", item.id.as_str())))
+        {
+            if !safe_id(id) {
+                errors.push(format!(
+                    "{kind} id '{id}' must use only letters, digits, '.', '-', or '_'"
+                ));
+            }
+        }
 
         let slots: BTreeSet<&str> = self.slots.iter().map(|slot| slot.id.as_str()).collect();
         let ports: BTreeMap<&str, &Port> = self
@@ -359,6 +387,120 @@ impl Blueprint {
         flows.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
         let bytes = serde_json::to_vec(&(slots, ports, flows)).expect("shape is serializable");
         format!("b3:{}", blake3::hash(&bytes).to_hex())
+    }
+
+    /// Run explicit, repository-authored witness commands from the requested repository root.
+    pub fn run_witnesses(&self, root: &Path) -> Vec<WitnessResult> {
+        self.witnesses
+            .iter()
+            .map(|witness| {
+                if witness.command.trim().is_empty() {
+                    return WitnessResult::failed(&witness.id, "witness command is empty");
+                }
+                match Command::new("sh")
+                    .args(["-c", &witness.command])
+                    .current_dir(root)
+                    .status()
+                {
+                    Ok(status) if status.success() => WitnessResult::passed(&witness.id),
+                    Ok(status) => {
+                        WitnessResult::failed(&witness.id, format!("command exited with {status}"))
+                    }
+                    Err(error) => WitnessResult::failed(&witness.id, error.to_string()),
+                }
+            })
+            .collect()
+    }
+
+    pub fn scaffold_files(&self, language: ScaffoldLanguage) -> Vec<ScaffoldFile> {
+        self.slots
+            .iter()
+            .map(|slot| scaffold_slot(self, slot, language))
+            .collect()
+    }
+}
+
+fn safe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+}
+
+fn snake(id: &str) -> String {
+    id.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn pascal(id: &str) -> String {
+    id.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn scaffold_slot(blueprint: &Blueprint, slot: &Slot, language: ScaffoldLanguage) -> ScaffoldFile {
+    let contracts = blueprint
+        .ports
+        .iter()
+        .filter(|port| port.slot == slot.id)
+        .map(|port| format!("{} {:?}: {}", port.id, port.direction, port.schema))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let name = pascal(&slot.id);
+    let stem = snake(&slot.id);
+    let (extension, content) = match language {
+        ScaffoldLanguage::Rust => (
+            "rs",
+            format!(
+                "//! Generated contract scaffold for slot `{}`.\n//! {}\n\npub trait {name} {{\n    /// Implement the locked port contract.\n    fn execute(&mut self) -> Result<(), Box<dyn std::error::Error>>;\n}}\n",
+                slot.id,
+                contracts.replace('\n', "\n//! ")
+            ),
+        ),
+        ScaffoldLanguage::Python => (
+            "py",
+            format!(
+                "\"\"\"Generated contract scaffold for slot `{}`.\n{}\n\"\"\"\nfrom abc import ABC, abstractmethod\n\n\nclass {name}(ABC):\n    @abstractmethod\n    def execute(self) -> None:\n        \"\"\"Implement the locked port contract.\"\"\"\n",
+                slot.id, contracts
+            ),
+        ),
+        ScaffoldLanguage::C => (
+            "h",
+            format!(
+                "/* Generated contract scaffold for slot `{}`.\n * {}\n */\n#ifndef BONSAI_{}_H\n#define BONSAI_{}_H\n\nint {}_execute(void *context);\n\n#endif\n",
+                slot.id,
+                contracts.replace('\n', "\n * "),
+                stem.to_ascii_uppercase(),
+                stem.to_ascii_uppercase(),
+                stem
+            ),
+        ),
+        ScaffoldLanguage::TypeScript => (
+            "ts",
+            format!(
+                "/** Generated contract scaffold for slot `{}`.\n * {}\n */\nexport interface {name} {{\n  execute(): Promise<void>;\n}}\n",
+                slot.id,
+                contracts.replace('\n', "\n * ")
+            ),
+        ),
+    };
+    ScaffoldFile {
+        relative_path: format!("{stem}.{extension}"),
+        content,
     }
 }
 

@@ -3,6 +3,9 @@
 //! engine (`diff`/`apply`) is the next, hardest-part-first build.
 
 use anyhow::{Context, Result};
+use bonsai::blueprint::{
+    Blueprint, BlueprintLock, Lifecycle, ScaffoldLanguage, ShapeDiff, WitnessResult,
+};
 use bonsai::config::Config;
 use bonsai::finding::{Finding, Location, Report, Severity};
 use bonsai::model::{Kind, NodeId, Plane};
@@ -34,6 +37,68 @@ enum HookAction {
     Uninstall,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BlueprintLanguage {
+    Rust,
+    Python,
+    C,
+    TypeScript,
+}
+
+impl From<BlueprintLanguage> for ScaffoldLanguage {
+    fn from(value: BlueprintLanguage) -> Self {
+        match value {
+            BlueprintLanguage::Rust => Self::Rust,
+            BlueprintLanguage::Python => Self::Python,
+            BlueprintLanguage::C => Self::C,
+            BlueprintLanguage::TypeScript => Self::TypeScript,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum BlueprintAction {
+    /// Parse and validate a declarative architecture shape.
+    Validate { blueprint: PathBuf },
+    /// Classify a change as implementation-only or a new logical shape.
+    Diff {
+        old: PathBuf,
+        new: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Execute all declared contract witnesses and save their results.
+    Verify {
+        blueprint: PathBuf,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = "bonsai.witnesses.json")]
+        out: PathBuf,
+    },
+    /// Freeze a locked, verified architecture shape.
+    Lock {
+        blueprint: PathBuf,
+        #[arg(long)]
+        results: PathBuf,
+        #[arg(long, default_value = "bonsai.blueprint.lock.json")]
+        out: PathBuf,
+    },
+    /// Fail when a blueprint no longer matches its lock.
+    Check {
+        blueprint: PathBuf,
+        #[arg(long)]
+        lock: PathBuf,
+    },
+    /// Generate non-overwriting contract stubs for each logical slot.
+    Scaffold {
+        blueprint: PathBuf,
+        #[arg(long, value_enum)]
+        language: BlueprintLanguage,
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
 #[derive(Parser)]
 #[command(
     name = "bonsai",
@@ -47,6 +112,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Author, prove, lock, and scaffold declarative architecture shapes.
+    Blueprint {
+        #[command(subcommand)]
+        action: BlueprintAction,
+    },
     /// Generate `bonsai.toml` by auto-deriving the directory capability tree.
     Init {
         #[arg(long, default_value = ".")]
@@ -177,6 +247,7 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Blueprint { action } => cmd_blueprint(action),
         Cmd::Init { root, force, skip } => cmd_init(&root, force, &skip),
         Cmd::Tree { root, files, depth } => cmd_tree(&root, files, depth),
         Cmd::Stat { root, top } => cmd_stat(&root, top),
@@ -211,6 +282,135 @@ fn main() -> Result<()> {
         Cmd::Place { file, root } => cmd_place(&root, &file),
         Cmd::Hook { action, root } => cmd_hook(&root, action),
     }
+}
+
+fn load_blueprint(path: &Path) -> Result<Blueprint> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading blueprint {}", path.display()))?;
+    Blueprint::from_toml(&text).with_context(|| format!("parsing blueprint {}", path.display()))
+}
+
+fn require_valid(blueprint: &Blueprint) -> Result<()> {
+    let errors = blueprint.validate();
+    anyhow::ensure!(
+        errors.is_empty(),
+        "invalid blueprint:\n- {}",
+        errors.join("\n- ")
+    );
+    Ok(())
+}
+
+fn cmd_blueprint(action: BlueprintAction) -> Result<()> {
+    match action {
+        BlueprintAction::Validate { blueprint } => {
+            let value = load_blueprint(&blueprint)?;
+            require_valid(&value)?;
+            println!("{} {}", value.meta.id, value.shape_digest());
+        }
+        BlueprintAction::Diff { old, new, json } => {
+            let old = load_blueprint(&old)?;
+            let new = load_blueprint(&new)?;
+            require_valid(&old)?;
+            require_valid(&new)?;
+            let diff = ShapeDiff::between(&old, &new);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diff)?);
+            } else {
+                println!(
+                    "{:?}: {} -> {}",
+                    diff.class, diff.old_digest, diff.new_digest
+                );
+            }
+        }
+        BlueprintAction::Verify {
+            blueprint,
+            root,
+            out,
+        } => {
+            let value = load_blueprint(&blueprint)?;
+            require_valid(&value)?;
+            let results = value.run_witnesses(&root);
+            std::fs::write(&out, serde_json::to_string_pretty(&results)? + "\n")
+                .with_context(|| format!("writing witness results {}", out.display()))?;
+            for result in &results {
+                println!(
+                    "{} {}{}",
+                    if result.passed { "PASS" } else { "FAIL" },
+                    result.id,
+                    if result.detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", result.detail)
+                    }
+                );
+            }
+            anyhow::ensure!(
+                results.iter().all(|result| result.passed),
+                "witnesses failed"
+            );
+        }
+        BlueprintAction::Lock {
+            blueprint,
+            results,
+            out,
+        } => {
+            let value = load_blueprint(&blueprint)?;
+            let results: Vec<WitnessResult> = serde_json::from_str(
+                &std::fs::read_to_string(&results)
+                    .with_context(|| format!("reading witness results {}", results.display()))?,
+            )?;
+            let lock = BlueprintLock::create(&value, &results)?;
+            std::fs::write(&out, lock.to_json()?)
+                .with_context(|| format!("writing blueprint lock {}", out.display()))?;
+            println!("locked {} at {}", lock.blueprint_id, lock.shape_digest);
+        }
+        BlueprintAction::Check { blueprint, lock } => {
+            let value = load_blueprint(&blueprint)?;
+            let lock = BlueprintLock::from_json(
+                &std::fs::read_to_string(&lock)
+                    .with_context(|| format!("reading blueprint lock {}", lock.display()))?,
+            )?;
+            let errors = lock.check(&value);
+            anyhow::ensure!(
+                errors.is_empty(),
+                "blueprint lock failed:\n- {}",
+                errors.join("\n- ")
+            );
+            println!("{}: locked shape intact", value.meta.id);
+        }
+        BlueprintAction::Scaffold {
+            blueprint,
+            language,
+            out,
+        } => {
+            let value = load_blueprint(&blueprint)?;
+            require_valid(&value)?;
+            let files = value.scaffold_files(language.into());
+            let existing: Vec<_> = files
+                .iter()
+                .map(|file| out.join(&file.relative_path))
+                .filter(|path| path.exists())
+                .collect();
+            anyhow::ensure!(
+                existing.is_empty(),
+                "refusing to overwrite scaffold files: {}",
+                existing
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            std::fs::create_dir_all(&out)
+                .with_context(|| format!("creating scaffold directory {}", out.display()))?;
+            for file in files {
+                let path = out.join(file.relative_path);
+                std::fs::write(&path, file.content)
+                    .with_context(|| format!("writing scaffold {}", path.display()))?;
+                println!("created {}", path.display());
+            }
+        }
+    }
+    Ok(())
 }
 
 const HOOK_MARK: &str = "# bonsai-managed pre-commit hook";
@@ -960,6 +1160,7 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
 const GLOBAL_RULES: &[&str] = &[
     "tree-invariant",
     "leanness-ratchet",
+    "blueprint-lock",
     "abstraction-layers",
     "abstraction-depth",
 ];
@@ -999,6 +1200,80 @@ fn changed_files(
         set.extend(run(&["diff", "--name-only", r]));
     }
     Some(set)
+}
+
+fn check_blueprint_locks(root: &Path) -> Vec<Finding> {
+    let mut paths = Vec::new();
+    let root_blueprint = root.join("bonsai.blueprint.toml");
+    if root_blueprint.exists() {
+        paths.push(root_blueprint);
+    }
+    let directory = root.join(".bonsai/blueprints");
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        paths.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("toml")),
+        );
+    }
+    paths.sort();
+
+    let mut findings = Vec::new();
+    for path in paths {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let blueprint = match load_blueprint(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                findings.push(Finding::new(
+                    "blueprint-lock",
+                    Severity::Error,
+                    error.to_string(),
+                    Location::file(&relative),
+                ));
+                continue;
+            }
+        };
+        let validation = blueprint.validate();
+        for error in validation {
+            findings.push(Finding::new(
+                "blueprint-lock",
+                Severity::Error,
+                error,
+                Location::file(&relative),
+            ));
+        }
+        if blueprint.meta.lifecycle != Lifecycle::Locked {
+            continue;
+        }
+        let lock_path = path.with_extension("lock.json");
+        let lock = std::fs::read_to_string(&lock_path)
+            .with_context(|| format!("reading required lock {}", lock_path.display()))
+            .and_then(|text| BlueprintLock::from_json(&text));
+        match lock {
+            Ok(lock) => {
+                for error in lock.check(&blueprint) {
+                    findings.push(Finding::new(
+                        "blueprint-lock",
+                        Severity::Error,
+                        error,
+                        Location::file(&relative),
+                    ));
+                }
+            }
+            Err(error) => findings.push(Finding::new(
+                "blueprint-lock",
+                Severity::Error,
+                error.to_string(),
+                Location::file(&relative),
+            )),
+        }
+    }
+    findings
 }
 
 fn cmd_check(
@@ -1062,7 +1337,11 @@ fn cmd_check(
         findings.extend(bonsai::contracts::evaluate(&ws, &cfg.contracts));
     }
 
-    // 5. the migration valve: grandfather declared/in-flight exceptions (allow-list) so an
+    // 5. conventionally discovered shape locks make the existing hook and CI command protect
+    //    declarative architecture without requiring a second gate.
+    findings.extend(check_blueprint_locks(root));
+
+    // 6. the migration valve: grandfather declared/in-flight exceptions (allow-list) so an
     //    intentional change doesn't fight the gate — but report what was exempted (never silent).
     let exempted = if let Some(allow) = cfg.rules.as_ref().map(|r| &r.allow) {
         let (kept, exempted) = bonsai::rules::apply_allow(findings, allow);
@@ -1072,11 +1351,11 @@ fn cmd_check(
         Vec::new()
     };
 
-    // 6. inline `// bonsai:allow` — the line-level valve for a genuine false positive at source.
+    // 7. inline `// bonsai:allow` — the line-level valve for a genuine false positive at source.
     let (kept, suppressed) = bonsai::rules::apply_inline_suppression(root, findings);
     findings = kept;
 
-    // 7. diff-scoping: with --staged/--since, keep only findings on changed files (plus the
+    // 8. diff-scoping: with --staged/--since, keep only findings on changed files (plus the
     //    repo-wide gates), so the pre-commit hook judges the addition, not pre-existing debt.
     let scoped = changed_files(root, staged, since);
     if let Some(changed) = &scoped {
