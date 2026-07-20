@@ -207,3 +207,31 @@ fn lock_detects_changed_witness_contract() {
         .iter()
         .any(|error| error.contains("witness contract changed")));
 }
+
+#[test]
+fn evolution_preserves_every_historical_permanent_port() {
+    let old = Blueprint::from_toml(CODEC).unwrap();
+    let mut next = old.clone();
+    next.meta.id = "codec.lossless.v2".into();
+    next.meta.supersedes = Some(old.meta.id.clone());
+    assert_eq!(
+        Blueprint::validate_evolution(&old, &next),
+        Vec::<String>::new()
+    );
+
+    next.ports.retain(|port| port.id != "raw");
+    let errors = Blueprint::validate_evolution(&old, &next);
+    assert!(errors
+        .iter()
+        .any(|error| error.contains("permanent port 'raw'")));
+}
+
+#[test]
+fn evolution_must_name_the_shape_it_supersedes() {
+    let old = Blueprint::from_toml(CODEC).unwrap();
+    let mut next = old.clone();
+    next.meta.id = "codec.lossless.v2".into();
+    assert!(Blueprint::validate_evolution(&old, &next)
+        .iter()
+        .any(|error| error.contains("must supersede")));
+}

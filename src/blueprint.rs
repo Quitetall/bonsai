@@ -368,6 +368,47 @@ impl Blueprint {
         errors
     }
 
+    /// Validate a new blueprint identity against the complete compatibility surface of the
+    /// shape it supersedes. Because every generation carries all historical permanent ports,
+    /// applying this rule at each transition preserves compatibility transitively.
+    pub fn validate_evolution(old: &Blueprint, new: &Blueprint) -> Vec<String> {
+        let mut errors = new.validate();
+        if old.meta.id == new.meta.id {
+            errors.push("an evolved shape must use a new blueprint identity".into());
+        }
+        if new.meta.supersedes.as_deref() != Some(old.meta.id.as_str()) {
+            errors.push(format!(
+                "blueprint '{}' must supersede '{}'",
+                new.meta.id, old.meta.id
+            ));
+        }
+        let current_ports: BTreeMap<&str, &Port> = new
+            .ports
+            .iter()
+            .map(|port| (port.id.as_str(), port))
+            .collect();
+        for historical in old
+            .ports
+            .iter()
+            .filter(|port| port.compatibility == CompatibilityPolicy::Permanent)
+        {
+            match current_ports.get(historical.id.as_str()) {
+                Some(current) if *current == historical => {}
+                Some(_) => errors.push(format!(
+                    "historical permanent port '{}' changed; retain its complete contract and adapt directly below it",
+                    historical.id
+                )),
+                None => errors.push(format!(
+                    "historical permanent port '{}' is missing; retain it so old callers remain supported",
+                    historical.id
+                )),
+            }
+        }
+        errors.sort();
+        errors.dedup();
+        errors
+    }
+
     /// Digest only logical shape. Implementations, witnesses, description, and lifecycle are
     /// deliberately excluded so compatible implementation evolution keeps one shape identity.
     pub fn shape_digest(&self) -> String {

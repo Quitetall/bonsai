@@ -111,6 +111,12 @@ boundary, keeping compatibility cost visible and preventing a fragile tower of h
 Multi-slot fused implementations require every slot to opt in and a differential witness covering
 the complete fused region.
 
+When a blueprint declares `supersedes`, the repository gate resolves both identities and requires
+the new shape to retain every complete permanent-port contract from its predecessor. Because each
+generation carries the full historical set, this rule is transitive: arbitrarily old callers stay
+represented, and any conversion remains a direct adapter immediately below the stable boundary.
+Historical blueprint files must remain in `.bonsai/blueprints/`; a missing predecessor fails closed.
+
 Scaffolding emits non-overwriting typed input/output envelopes, schema constants, implementation
 signatures, and contract-test surfaces for Rust, Python, C, and TypeScript. Payloads cross the
 generated seam as schema-governed bytes so repositories can bind their own generated or native

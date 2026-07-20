@@ -1284,6 +1284,7 @@ const GLOBAL_RULES: &[&str] = &[
     "tree-invariant",
     "leanness-ratchet",
     "blueprint-lock",
+    "blueprint-evolution",
     "abstraction-layers",
     "abstraction-depth",
 ];
@@ -1343,6 +1344,7 @@ fn check_blueprint_locks(root: &Path) -> Vec<Finding> {
     paths.sort();
 
     let mut findings = Vec::new();
+    let mut loaded = std::collections::BTreeMap::<String, (String, Blueprint)>::new();
     for path in paths {
         let relative = path
             .strip_prefix(root)
@@ -1361,6 +1363,20 @@ fn check_blueprint_locks(root: &Path) -> Vec<Finding> {
                 continue;
             }
         };
+        if loaded
+            .insert(
+                blueprint.meta.id.clone(),
+                (relative.clone(), blueprint.clone()),
+            )
+            .is_some()
+        {
+            findings.push(Finding::new(
+                "blueprint-evolution",
+                Severity::Error,
+                format!("duplicate blueprint identity '{}'", blueprint.meta.id),
+                Location::file(&relative),
+            ));
+        }
         let validation = blueprint.validate();
         for error in validation {
             findings.push(Finding::new(
@@ -1410,6 +1426,32 @@ fn check_blueprint_locks(root: &Path) -> Vec<Finding> {
                 Severity::Error,
                 error.to_string(),
                 Location::file(&relative),
+            )),
+        }
+    }
+    for (relative, blueprint) in loaded.values() {
+        let Some(previous_id) = blueprint.meta.supersedes.as_deref() else {
+            continue;
+        };
+        match loaded.get(previous_id) {
+            Some((_, previous)) => {
+                for error in Blueprint::validate_evolution(previous, blueprint) {
+                    findings.push(Finding::new(
+                        "blueprint-evolution",
+                        Severity::Error,
+                        error,
+                        Location::file(relative),
+                    ));
+                }
+            }
+            None => findings.push(Finding::new(
+                "blueprint-evolution",
+                Severity::Error,
+                format!(
+                    "superseded blueprint '{}' is not present; retain historical shapes in .bonsai/blueprints",
+                    previous_id
+                ),
+                Location::file(relative),
             )),
         }
     }
