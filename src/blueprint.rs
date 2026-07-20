@@ -610,7 +610,7 @@ fn scaffold_slot(blueprint: &Blueprint, slot: &Slot, language: ScaffoldLanguage)
             (
                 "py",
                 format!(
-                    "\"\"\"Generated typed contract scaffold for slot `{}`.\n{}\n\"\"\"\nfrom dataclasses import dataclass\nfrom typing import Protocol\n\n{schema_constants}\n@dataclass(frozen=True)\nclass {name}Input:\n{}\n@dataclass(frozen=True)\nclass {name}Output:\n{}\nclass {name}(Protocol):\n    def execute(self, input: {name}Input) -> {name}Output: ...\n\n\ndef test_schema_contract_is_well_formed() -> None:\n    assert all(({}))\n",
+                    "\"\"\"Generated typed contract scaffold for slot `{}`.\n{}\n\"\"\"\nfrom dataclasses import dataclass\nfrom typing import Protocol\n\n{schema_constants}\n@dataclass(frozen=True)\nclass {name}Input:\n{}\n@dataclass(frozen=True)\nclass {name}Output:\n{}\nclass {name}(Protocol):\n    def execute(self, input: {name}Input) -> {name}Output: ...\n\n\ndef assert_implementation(value: {name}) -> {name}:\n    return value\n\n\ndef test_schema_contract_is_well_formed() -> None:\n    assert all(({}))\n",
                     slot.id,
                     contracts,
                     python_fields(&inputs),
@@ -652,10 +652,25 @@ fn scaffold_slot(blueprint: &Blueprint, slot: &Slot, language: ScaffoldLanguage)
                     )
                 })
                 .collect::<String>();
+            let schema_checks = if ports.is_empty() {
+                "1".into()
+            } else {
+                ports
+                    .iter()
+                    .map(|port| {
+                        format!(
+                            "(sizeof(BONSAI_{}_{}_SCHEMA) > 1)",
+                            upper,
+                            snake(&port.id).to_ascii_uppercase()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" && ")
+            };
             (
                 "h",
                 format!(
-                    "/* Generated typed contract scaffold for slot `{}`.\n * {}\n */\n#ifndef BONSAI_{upper}_H\n#define BONSAI_{upper}_H\n#include <stddef.h>\n\n{schema_constants}\ntypedef struct {{\n{}}} {stem}_input;\n\ntypedef struct {{\n{}}} {stem}_output;\n\nint {stem}_execute(void *context, const {stem}_input *input, {stem}_output *output);\n\n#endif\n",
+                    "/* Generated typed contract scaffold for slot `{}`.\n * {}\n */\n#ifndef BONSAI_{upper}_H\n#define BONSAI_{upper}_H\n#include <stddef.h>\n\n{schema_constants}\ntypedef struct {{\n{}}} {stem}_input;\n\ntypedef struct {{\n{}}} {stem}_output;\n\ntypedef int (*{stem}_implementation)(void *context, const {stem}_input *input, {stem}_output *output);\nint {stem}_execute(void *context, const {stem}_input *input, {stem}_output *output);\n\nstatic inline int {stem}_schema_contract_is_well_formed(void) {{\n    return {schema_checks};\n}}\n\n#endif\n",
                     slot.id,
                     contracts.replace('\n', "\n * "),
                     c_fields(&inputs),
@@ -680,10 +695,15 @@ fn scaffold_slot(blueprint: &Blueprint, slot: &Slot, language: ScaffoldLanguage)
                     )
                 })
                 .collect::<String>();
+            let schemas = ports
+                .iter()
+                .map(|port| snake(&port.id).to_ascii_uppercase() + "_SCHEMA")
+                .collect::<Vec<_>>()
+                .join(", ");
             (
                 "ts",
                 format!(
-                    "/** Generated typed contract scaffold for slot `{}`.\n * {}\n */\n{schema_constants}\nexport interface {name}Input {{\n{}}}\n\nexport interface {name}Output {{\n{}}}\n\nexport interface {name} {{\n  execute(input: {name}Input): Promise<{name}Output>;\n}}\n",
+                    "/** Generated typed contract scaffold for slot `{}`.\n * {}\n */\n{schema_constants}\nexport interface {name}Input {{\n{}}}\n\nexport interface {name}Output {{\n{}}}\n\nexport interface {name} {{\n  execute(input: {name}Input): Promise<{name}Output>;\n}}\n\nexport function assert{name}Implementation(value: {name}): {name} {{\n  return value;\n}}\n\nexport function test{name}SchemaContract(): void {{\n  const schemas = [{schemas}];\n  if (schemas.some((schema) => schema.length === 0)) throw new Error('empty Bonsai schema');\n}}\n",
                     slot.id,
                     contracts.replace('\n', "\n * "),
                     ts_fields(&inputs),

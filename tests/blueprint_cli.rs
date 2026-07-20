@@ -199,6 +199,7 @@ fn scaffold_emits_language_specific_contract_stubs_without_overwrite() {
                 "class IngestInput",
                 "bytes: bytes",
                 "def execute(self, input:",
+                "def assert_implementation",
             ][..],
         ),
         (
@@ -208,6 +209,7 @@ fn scaffold_emits_language_specific_contract_stubs_without_overwrite() {
                 "typedef struct",
                 "bytes_data",
                 "ingest_execute(void *context, const ingest_input *input",
+                "ingest_schema_contract_is_well_formed",
             ][..],
         ),
         (
@@ -217,6 +219,8 @@ fn scaffold_emits_language_specific_contract_stubs_without_overwrite() {
                 "interface IngestInput",
                 "bytes: Uint8Array",
                 "execute(input: IngestInput)",
+                "assertIngestImplementation",
+                "testIngestSchemaContract",
             ][..],
         ),
     ] {
