@@ -111,6 +111,9 @@ enum GraphAction {
         /// SCIP compiler index to normalize into symbol and file dependency facts (repeatable).
         #[arg(long)]
         scip: Vec<PathBuf>,
+        /// Discover conventional blueprints and SCIP indices under the graph root.
+        #[arg(long)]
+        discover: bool,
         #[arg(long)]
         parent: Option<String>,
         #[arg(long = "ref", default_value = "main")]
@@ -161,6 +164,8 @@ enum Cmd {
     },
     /// Build and query immutable, provenance-bearing repository fact snapshots.
     Graph {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
         #[command(subcommand)]
         action: GraphAction,
     },
@@ -295,7 +300,7 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Blueprint { action } => cmd_blueprint(action),
-        Cmd::Graph { action } => cmd_graph(action),
+        Cmd::Graph { root, action } => cmd_graph(&root, action),
         Cmd::Init { root, force, skip } => cmd_init(&root, force, &skip),
         Cmd::Tree { root, files, depth } => cmd_tree(&root, files, depth),
         Cmd::Stat { root, top } => cmd_stat(&root, top),
@@ -472,31 +477,85 @@ fn open_fact_store(path: &Path) -> Result<SqliteFactStore> {
     SqliteFactStore::open(path).with_context(|| format!("opening fact database {}", path.display()))
 }
 
-fn cmd_graph(action: GraphAction) -> Result<()> {
+fn rooted(root: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn discover_graph_inputs(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut blueprints = std::collections::BTreeSet::new();
+    let root_blueprint = root.join("bonsai.blueprint.toml");
+    if root_blueprint.is_file() {
+        blueprints.insert(root_blueprint);
+    }
+    let blueprint_dir = root.join(".bonsai/blueprints");
+    if let Ok(entries) = std::fs::read_dir(blueprint_dir) {
+        blueprints.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("toml")),
+        );
+    }
+
+    let mut scip = std::collections::BTreeSet::new();
+    for candidate in [root.join("index.scip"), root.join(".bonsai/index.scip")] {
+        if candidate.is_file() {
+            scip.insert(candidate);
+        }
+    }
+    let index_dir = root.join(".bonsai/indexes");
+    if let Ok(entries) = std::fs::read_dir(index_dir) {
+        scip.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("scip")),
+        );
+    }
+    (blueprints.into_iter().collect(), scip.into_iter().collect())
+}
+
+fn cmd_graph(root: &Path, action: GraphAction) -> Result<()> {
     match action {
         GraphAction::Snapshot {
             db,
-            blueprint,
-            scip,
+            mut blueprint,
+            mut scip,
+            discover,
             parent,
             reference,
         } => {
+            if discover {
+                let (found_blueprints, found_scip) = discover_graph_inputs(root);
+                blueprint.extend(found_blueprints);
+                scip.extend(found_scip);
+                blueprint.sort();
+                blueprint.dedup();
+                scip.sort();
+                scip.dedup();
+            }
             anyhow::ensure!(
                 !blueprint.is_empty() || !scip.is_empty(),
-                "graph snapshot needs at least one --blueprint or --scip input"
+                "graph snapshot needs --discover or at least one --blueprint/--scip input"
             );
-            let store = open_fact_store(&db)?;
+            let store = open_fact_store(&rooted(root, db))?;
             let parent_id = parent
                 .as_deref()
                 .map(|value| store.resolve_snapshot(value))
                 .transpose()?;
             let mut facts = Vec::new();
             for path in blueprint {
+                let path = rooted(root, path);
                 let value = load_blueprint(&path)?;
                 require_valid(&value)?;
                 facts.extend(facts_from_blueprint(&value, &path.to_string_lossy()));
             }
             for path in scip {
+                let path = rooted(root, path);
                 let bytes = std::fs::read(&path)
                     .with_context(|| format!("reading SCIP index {}", path.display()))?;
                 let digest = format!("b3:{}", blake3::hash(&bytes).to_hex());
@@ -509,7 +568,7 @@ fn cmd_graph(action: GraphAction) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
         }
         GraphAction::Query { db, snapshot, bql } => {
-            let store = open_fact_store(&db)?;
+            let store = open_fact_store(&rooted(root, db))?;
             let snapshot = store.resolve_snapshot(&snapshot)?;
             let query = BqlQuery::parse(&bql)?;
             println!(
@@ -518,7 +577,7 @@ fn cmd_graph(action: GraphAction) -> Result<()> {
             );
         }
         GraphAction::Export { db, snapshot } => {
-            let store = open_fact_store(&db)?;
+            let store = open_fact_store(&rooted(root, db))?;
             let snapshot = store.resolve_snapshot(&snapshot)?;
             println!(
                 "{}",
@@ -526,7 +585,7 @@ fn cmd_graph(action: GraphAction) -> Result<()> {
             );
         }
         GraphAction::Graphql { db, query } => {
-            let store = open_fact_store(&db)?;
+            let store = open_fact_store(&rooted(root, db))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&bonsai::graphql::execute_query(store, &query))?

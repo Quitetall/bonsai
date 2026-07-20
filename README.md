@@ -89,6 +89,7 @@ bonsai blueprint scaffold architecture/codec.toml --language rust --out src/cont
 
 # Repository fact graph and query surfaces
 bonsai graph snapshot --blueprint architecture/codec.toml --ref main
+bonsai graph --root . snapshot --discover --ref main  # conventional blueprints + SCIP indices
 bonsai graph query --snapshot main --bql 'IMPACT codec.v1#slot/predict DEPTH 3'
 bonsai graph graphql --query '{ impact(entity: "codec.v1#slot/predict", depth: 3) { entities } }'
 ```
@@ -129,6 +130,11 @@ Blueprint adapters emit provenance-bearing facts into a bundled SQLite store. Sn
 deduplicated by BLAKE3 over their parent and canonical facts. BQL deliberately starts small and
 bounded—`DEPENDENCIES` or `IMPACT`, an entity, and an explicit depth from 1 to 64. The same store is
 projected through read-only GraphQL for tools that prefer a schema-driven API.
+
+`graph snapshot --discover` rebuilds from `bonsai.blueprint.toml`,
+`.bonsai/blueprints/*.toml`, and SCIP indices at `index.scip`, `.bonsai/index.scip`, or
+`.bonsai/indexes/*.scip`. This is the refresh seam used by Katana before querying `main`;
+explicit historical snapshots are queried without mutation.
 
 This split is intentional: SQLite and deterministic traversal are the authority; BQL and GraphQL
 are interfaces over it. The first source adapters ingest blueprints and SCIP symbol/file

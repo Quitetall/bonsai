@@ -20,6 +20,8 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
   contract pinned into lock schema v2.
 - **Immutable typed fact snapshots** in bundled SQLite, source provenance, mutable refs over
   immutable history, bounded BQL dependency/impact traversal, and a read-only GraphQL projection.
+- **Repository authority discovery** for conventional blueprint and SCIP paths, enabling harnesses
+  to rebuild `main` before agent queries while leaving historical snapshots immutable.
 - **Katana integration** through brokered MCP tools, replay-recorded results, a native deterministic
   Bonsai oracle, and optional data-only impact/shape-safe workflows.
 - **LamQuant production proof** locking the existing LML lossless pipeline and its typed-chain,

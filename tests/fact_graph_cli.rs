@@ -74,3 +74,28 @@ to = "input"
         "pipeline.v1#slot/ingest"
     );
 }
+
+#[test]
+fn graph_snapshot_discovers_repository_authorities_under_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let blueprints = dir.path().join(".bonsai/blueprints");
+    fs::create_dir_all(&blueprints).unwrap();
+    fs::write(
+        blueprints.join("service.toml"),
+        r#"[blueprint]
+id = "service.v1"
+[[slot]]
+id = "ingest"
+"#,
+    )
+    .unwrap();
+
+    assert!(Command::new(env!("CARGO_BIN_EXE_bonsai"))
+        .args(["graph", "--root"])
+        .arg(dir.path())
+        .args(["snapshot", "--discover"])
+        .status()
+        .unwrap()
+        .success());
+    assert!(dir.path().join(".bonsai/facts.db").exists());
+}

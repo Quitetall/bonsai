@@ -40,3 +40,5 @@ Every adapter must name itself, retain a source locator and digest, remain deter
 The supported repository layout is either one `bonsai.blueprint.toml` or multiple `.bonsai/blueprints/*.toml` files with adjacent `*.lock.json` files for locked lifecycles. `bonsai check` discovers these automatically. Local databases and scan caches belong under `.bonsai/` and should not be committed; blueprints, locks, and witness records should be committed.
 
 SQLite is the default local store because it is portable, inspectable, transaction-safe, and requires no service. Content-addressed snapshots make comparisons and agent replay reproducible. A server deployment may wrap the same interfaces later, but local execution remains the semantic floor.
+
+Agent harnesses should refresh the mutable `main` ref with `bonsai graph --root . snapshot --discover` before asking for current context. Discovery consumes conventional blueprint files and available SCIP indices; repositories remain responsible for regenerating compiler indices after code changes. Historical refs and content-addressed snapshot IDs are never refreshed in place.
