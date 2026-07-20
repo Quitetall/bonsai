@@ -118,6 +118,14 @@ enum Cmd {
         /// Output format: text (default), json, or sarif (CI code scanning).
         #[arg(long, value_enum, default_value = "text")]
         format: Format,
+        /// Scope file-level findings to git-staged files (the addition being committed). Repo-wide
+        /// gates (ratchet, invariants, abstraction bounds) still apply. Ideal for the pre-commit hook.
+        #[arg(long)]
+        staged: bool,
+        /// Scope file-level findings to files changed since <ref> (e.g. `origin/main`). Combines
+        /// with `--staged`.
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Docs plane: run the recursive compose executor (byte-identity gate + recursion).
     Docs {
@@ -189,7 +197,9 @@ fn main() -> Result<()> {
             root,
             no_cache,
             format,
-        } => cmd_check(&root, !no_cache, format),
+            staged,
+            since,
+        } => cmd_check(&root, !no_cache, format, staged, since.as_deref()),
         Cmd::Docs { root } => cmd_docs(&root),
         Cmd::Index {
             root,
@@ -226,7 +236,7 @@ fn cmd_hook(root: &Path, action: HookAction) -> Result<()> {
                 );
             }
             let script = format!(
-                "#!/bin/sh\n{HOOK_MARK}\n# Blocks a commit that regresses structure, leanness, or a level contract.\nexec bonsai check --root \"$(git rev-parse --show-toplevel)\"\n"
+                "#!/bin/sh\n{HOOK_MARK}\n# Blocks a commit that regresses structure, leanness, or a level contract.\n# --staged scopes file-level findings to the addition; repo-wide gates still apply.\nexec bonsai check --staged --root \"$(git rev-parse --show-toplevel)\"\n"
             );
             std::fs::write(&hook, script).with_context(|| format!("writing {}", hook.display()))?;
             set_executable(&hook)?;
@@ -869,7 +879,59 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
     Ok(())
 }
 
-fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
+/// Rules that are repo-wide by nature — they bypass diff-scoping (a leanness regression or a
+/// too-deep tree is a whole-repo fact, not attributable to one changed file).
+const GLOBAL_RULES: &[&str] = &[
+    "tree-invariant",
+    "leanness-ratchet",
+    "abstraction-layers",
+    "abstraction-depth",
+];
+
+/// The set of files git reports changed (`--staged` = index vs HEAD; `--since <ref>` = vs ref);
+/// their union. `None` if no scope was requested; empty set if git failed (nothing scoped in).
+fn changed_files(
+    root: &Path,
+    staged: bool,
+    since: Option<&str>,
+) -> Option<std::collections::BTreeSet<String>> {
+    if !staged && since.is_none() {
+        return None;
+    }
+    let mut set = std::collections::BTreeSet::new();
+    let run = |args: &[&str]| -> Vec<String> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if staged {
+        set.extend(run(&["diff", "--cached", "--name-only"]));
+    }
+    if let Some(r) = since {
+        set.extend(run(&["diff", "--name-only", r]));
+    }
+    Some(set)
+}
+
+fn cmd_check(
+    root: &Path,
+    cache: bool,
+    format: Format,
+    staged: bool,
+    since: Option<&str>,
+) -> Result<()> {
     let cfg = load_or_derive(root)?;
     let tree = cfg.into_tree(Some(root))?;
     let graph = load_graph_opt(root); // shared by the ratchet + the conformance rules
@@ -937,6 +999,15 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
     let (kept, suppressed) = bonsai::rules::apply_inline_suppression(root, findings);
     findings = kept;
 
+    // 7. diff-scoping: with --staged/--since, keep only findings on changed files (plus the
+    //    repo-wide gates), so the pre-commit hook judges the addition, not pre-existing debt.
+    let scoped = changed_files(root, staged, since);
+    if let Some(changed) = &scoped {
+        findings.retain(|f| {
+            GLOBAL_RULES.contains(&f.rule.as_str()) || changed.contains(&f.location.file)
+        });
+    }
+
     let report = Report::new(findings);
 
     // Machine formats: emit the finding stream, then fail closed if any error exists
@@ -965,6 +1036,12 @@ fn cmd_check(root: &Path, cache: bool, format: Format) -> Result<()> {
     }
     if suppressed > 0 {
         println!("  ⓘ {suppressed} finding(s) waived inline (// bonsai:allow)");
+    }
+    if let Some(changed) = &scoped {
+        println!(
+            "  ⓘ diff-scoped to {} changed file(s) (repo-wide gates still apply)",
+            changed.len()
+        );
     }
 
     // Warnings (e.g. premature-abstraction) are reported but do NOT fail the gate — only

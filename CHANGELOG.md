@@ -5,6 +5,12 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — ergonomics
+- **Diff-scoped checking** — `bonsai check --staged` (index vs HEAD) / `--since <ref>` scope
+  file-level findings to the changed files, so the pre-commit hook judges *the addition* rather
+  than pre-existing debt in untouched files. Repo-wide gates (leanness ratchet, tree invariants,
+  abstraction bounds) always apply. The installed hook now uses `--staged`.
+
 ### Added — false-positive reduction (trust)
 - **Inline `// bonsai:allow` suppression** — the line-level FP valve: a finding is waived when its
   own line or the line above carries `// bonsai:allow` (any rule), `// bonsai:allow(dead-code)`
