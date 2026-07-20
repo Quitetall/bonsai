@@ -113,6 +113,29 @@ to = "input"
 }
 
 #[test]
+fn blueprint_fact_provenance_changes_with_implementation_bindings() {
+    let source = r#"[blueprint]
+id = "pipeline.v1"
+[[slot]]
+id = "process"
+[[implementation]]
+id = "processor"
+slots = ["process"]
+bindings = ["src/process.rs#VERSION"]
+"#;
+    let first = Blueprint::from_toml(&source.replace("VERSION", "V1")).unwrap();
+    let second = Blueprint::from_toml(&source.replace("VERSION", "V2")).unwrap();
+    assert_eq!(first.shape_digest(), second.shape_digest());
+
+    let first_facts = facts_from_blueprint(&first, "pipeline.toml");
+    let second_facts = facts_from_blueprint(&second, "pipeline.toml");
+    assert_ne!(
+        first_facts[0].source.digest, second_facts[0].source.digest,
+        "fact provenance must identify the complete authoritative input"
+    );
+}
+
+#[test]
 fn mutable_refs_point_to_immutable_snapshots() {
     let dir = tempfile::tempdir().unwrap();
     let store = SqliteFactStore::open(dir.path().join("facts.db")).unwrap();

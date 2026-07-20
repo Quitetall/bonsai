@@ -270,10 +270,12 @@ impl FactStore for SqliteFactStore {
 }
 
 pub fn facts_from_blueprint(blueprint: &Blueprint, locator: &str) -> Vec<Fact> {
+    let source_bytes =
+        serde_json::to_vec(blueprint).expect("Blueprint contains only serializable values");
     let source = SourceRef {
         adapter: "bonsai-blueprint".into(),
         locator: locator.into(),
-        digest: blueprint.shape_digest(),
+        digest: format!("b3:{}", blake3::hash(&source_bytes).to_hex()),
     };
     let entity = |kind: &str, id: &str| format!("{}#{kind}/{id}", blueprint.meta.id);
     let mut facts = Vec::new();
