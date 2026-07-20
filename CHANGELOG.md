@@ -5,6 +5,25 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — repository digital twin and executable architecture
+- **Declarative blueprints** for slots, typed ports, flows, invariants, implementations, variants,
+  direct compatibility adapters, fusion policy, and executable witnesses.
+- **Shape locks and semantic diffs** with content-stable BLAKE3 identities. Implementation changes
+  remain within one identity; topology/schema/invariant changes require a new identity.
+- **Contract scaffolding** for Rust, Python, C, and TypeScript. Generation is non-overwriting.
+- **Automatic admission-gate integration**: `bonsai check` discovers root and `.bonsai/blueprints/`
+  contracts, validates them, and fails on missing or drifting locks.
+- **Immutable typed fact snapshots** in bundled SQLite, source provenance, mutable refs over
+  immutable history, bounded BQL dependency/impact traversal, and a read-only GraphQL projection.
+- **Katana integration** through brokered MCP tools, replay-recorded results, a native deterministic
+  Bonsai oracle, and optional data-only impact/shape-safe workflows.
+- **LamQuant production proof** locking the existing LML lossless pipeline and its typed-chain,
+  independent reference-DAG, and firmware/desktop byte-equality witnesses.
+
+### Changed
+- The framework is now Apache-2.0 licensed to support broad adoption across infrastructure,
+  production, and meta-repository ecosystems.
+
 ### Added — polyglot duplication
 - **Python function-clone detection** — the clone fold now spans `.rs` (brace-matched) *and*
   `.py` (indentation-based `def`/`async def` blocks); `Workspace::from_dir_ext` reads both. Excludes

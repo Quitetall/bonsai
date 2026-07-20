@@ -5,10 +5,10 @@
 name = "bonsai"
 version = "0.1.0"
 edition = "2021"
-description = "A recursive atom/parent structure engine: parallel dedup, dead-code, reference-safe moves, and a fail-closed leanness gate for any repo — laptop to monorepo."
-license = "AGPL-3.0-or-later"
+description = "A local-first repository digital twin: declarative architecture locks, typed fact snapshots, impact queries, and structural conformance."
+license = "Apache-2.0"
 repository = "https://github.com/QuiteTall/bonsai"
-keywords = ["refactoring", "duplication", "dead-code", "sarif", "monorepo"]
+keywords = ["architecture", "knowledge-graph", "refactoring", "scip", "monorepo"]
 categories = ["development-tools", "command-line-utilities"]
 
 [[bin]]

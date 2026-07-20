@@ -1,9 +1,16 @@
 # Bonsai
 
-**A recursive atom/parent structure engine — `cargo fmt` for your whole repository.** Point it
-at any tree (a laptop project or a monorepo) and it finds duplication, near-duplication, dead code,
-empty structure, and misplaced files; renders a complexity map; performs **reference-safe file
-moves**; and enforces a **fail-closed leanness gate** in CI. One engine governs both code and docs.
+**A local-first repository digital twin and executable architecture contract.** Bonsai lets a team
+declare what a serious production system does, bind that logical shape to real implementations,
+prove the bindings, and lock the shape against accidental drift. Underneath, it combines a
+Kythe-like typed fact graph, bounded impact queries, GraphQL, structural analysis, reference-safe
+refactoring, and fail-closed repository gates.
+
+The original recursive atom/parent engine remains the structural substrate. Blueprints add the
+missing semantic layer: slots, typed ports, flows, variants, compatibility adapters, invariants,
+implementation bindings, and executable witnesses. A new predictor can inhabit the existing
+`Predict` slot; changing `Transform → Predict` into a different topology requires a new blueprint
+identity. Optimized fused code is allowed only when a differential witness proves it equivalent.
 
 Bonsai reads *tracked* structure (it respects `.gitignore`), scans in parallel with a strong,
 cached content hash, and reports through a uniform finding stream — human text, JSON, or **SARIF
@@ -22,14 +29,21 @@ bonsai lean — 4004 files, 718 composites, depth 10
 
 ## Why
 
-Refactoring has two halves. The **semantic** half (does the logic make sense?) needs a human. The
-**structural** half — where a file lives, whether it's dead or duplicated, whether it's organized by
-how it's actually used — is *computable*. Bonsai automates the structural half and holds the repo at
-its provable minimum, tracked as a ratcheted trend so it can never silently rot.
+Production complexity is spread across code, schemas, build systems, infrastructure, tests, docs,
+and compatibility history. Search can locate fragments but cannot state which boundaries are
+intentional, which changes are implementation-only, or what must never break. Bonsai turns those
+claims into versioned data and deterministic gates while retaining the structural hygiene engine
+that keeps a repository at its provable minimum.
 
 ## The model
 
-Three orthogonal structures, never conflated:
+Four orthogonal structures, never conflated:
+
+- **Logical shape** — blueprint slots connected by typed ports and flows. Shape identity excludes
+  prose and implementation bindings but includes topology, schemas, compatibility, fusion policy,
+  and invariants.
+- **Typed facts** — immutable, content-addressed SQLite snapshots with source provenance. Mutable
+  refs such as `main` point to immutable snapshots; they never rewrite history.
 
 - **Containment** — a single-rooted tree of `Node`s. A node is an **atom** (leaf) or a **composite**
   (parent); a composite may be a child of another composite, so the tree recurses to arbitrary
@@ -64,9 +78,61 @@ bonsai tidy                     # propose reference-safe moves from the misplace
 bonsai ffi                      # stitch the Python↔Rust (PyO3) boundary SCIP can't see
 bonsai place src/foo.rs         # where does this belong? (coupling oracle; new or indexed file)
 bonsai hook install             # install the automatic pre-commit gate (runs check on commit)
+
+# Declarative architecture
+bonsai blueprint validate architecture/codec.toml
+bonsai blueprint verify architecture/codec.toml --root . --out witnesses.json
+bonsai blueprint lock architecture/codec.toml --results witnesses.json --out codec.lock.json
+bonsai blueprint check architecture/codec.toml --lock codec.lock.json
+bonsai blueprint diff old.toml new.toml
+bonsai blueprint scaffold architecture/codec.toml --language rust --out src/contracts
+
+# Repository fact graph and query surfaces
+bonsai graph snapshot --blueprint architecture/codec.toml --ref main
+bonsai graph query --snapshot main --bql 'IMPACT codec.v1#slot/predict DEPTH 3'
+bonsai graph graphql --query '{ impact(entity: "codec.v1#slot/predict", depth: 3) { entities } }'
 ```
 
 Every command takes `--root <dir>` (default `.`).
+
+## Shape locks and compatibility
+
+A locked blueprint is a change-control boundary, not a diagram. `bonsai blueprint lock` refuses to
+freeze an invalid shape, a non-locked lifecycle, a missing witness, or a failed witness. The lock
+pins the canonical shape digest, permanent external ports, and witness set. The ordinary
+`bonsai check` command automatically discovers `bonsai.blueprint.toml` and
+`.bonsai/blueprints/*.toml`, so existing hooks and CI protect the new contract.
+
+Permanent compatibility is expressed with versioned ports and direct, witnessed adapters. Bonsai
+rejects adapter chains: each supported old representation must adapt directly to the current
+boundary, keeping compatibility cost visible and preventing a fragile tower of historical shims.
+Multi-slot fused implementations require every slot to opt in and a differential witness covering
+the complete fused region.
+
+Scaffolding currently emits non-overwriting contract stubs for Rust, Python, C, and TypeScript.
+Generated stubs are a starting seam, never a source of authority; authored schemas, witnesses, and
+the lock remain authoritative.
+
+## Digital twin and query APIs
+
+Blueprint adapters emit provenance-bearing facts into a bundled SQLite store. Snapshots are
+deduplicated by BLAKE3 over their parent and canonical facts. BQL deliberately starts small and
+bounded—`DEPENDENCIES` or `IMPACT`, an entity, and an explicit depth from 1 to 64. The same store is
+projected through read-only GraphQL for tools that prefer a schema-driven API.
+
+This split is intentional: SQLite and deterministic traversal are the authority; BQL and GraphQL
+are interfaces over it. The first source adapters ingest blueprints and SCIP symbol/file
+dependencies. Additional adapters can ingest build metadata, deployment manifests, API schemas,
+ownership, policy, and runtime evidence without changing the core fact model.
+
+## Katana agentic harness
+
+Katana integrates Bonsai without giving the model architectural authority. Its MCP surface exposes
+`bonsai.query`, `bonsai.impact`, `bonsai.agent_context`, and `bonsai.shape_check`. Calls traverse
+Katana's normal broker, sandbox, output budget, and event log. Repositories containing a blueprint
+also receive a deterministic post-edit and post-task Bonsai oracle; service/critical tiers cannot
+declare completion while the gate is red. See Katana's `bonsai-integration.md` and data-only
+workflow package.
 
 ## Governed growth — where new code goes, enforced
 
@@ -165,12 +231,12 @@ facets = { layer = "codec", language = "rust" }
 
 ## Status
 
-Kernel, reference-safe moves, config/init, the parallel+cached scan substrate, the leanness folds
-(duplication, near-dup, dead code, misplacement, empty structure), the ratchet gate, the uniform
-finding model (text/JSON/SARIF), multi-language SCIP merge, the Python↔Rust FFI stitcher, and the
-docs-plane bridge are all built and tested (`cargo test`, clippy-clean, an edge-case battery, and a
-large-repo benchmark). See `CHANGELOG.md`.
+The blueprint kernel, witness runner, shape locks/diffs, four-language scaffolding, automatic hook
+integration, typed SQLite snapshots, BQL traversal, GraphQL projection, structural engine,
+reference-safe moves, leanness ratchet, JSON/SARIF findings, SCIP merge, FFI stitching, and docs
+plane are built and tested. The next adapter wave is build/deployment/schema ingestion and
+long-running GraphQL/MCP serving; the current CLI surfaces are stable local composition points.
 
 ## License
 
-AGPL-3.0-or-later. See `LICENSE`.
+Apache-2.0. See `LICENSE`.
