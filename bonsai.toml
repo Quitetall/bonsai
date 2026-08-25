@@ -39,4 +39,3 @@ plane = "code"
 [[contract]]
 path = "src"
 level = "move-engine"
-sealed = "ReferenceResolver"

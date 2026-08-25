@@ -2,3 +2,4 @@
 /.bonsai
 /graphify-out
 *.tmp.*
+*.tmp
