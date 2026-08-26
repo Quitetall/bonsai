@@ -78,6 +78,9 @@ bonsai tidy                     # propose reference-safe moves from the misplace
 bonsai ffi                      # stitch the Python↔Rust (PyO3) boundary SCIP can't see
 bonsai place src/foo.rs         # where does this belong? (coupling oracle; new or indexed file)
 bonsai hook install             # install the automatic pre-commit gate (runs check on commit)
+bonsai github init --repo owner/repo
+bonsai github plan              # remote drift only; never mutates
+bonsai github apply --confirm   # administrator-only explicit reconciliation
 
 # Declarative architecture
 bonsai blueprint validate architecture/codec.toml
@@ -229,6 +232,23 @@ index those signals are reported **unmeasured — never faked as zero**.
 - run: bonsai check                                   # exit 1 on any regression
 - run: bonsai lean --format sarif > bonsai.sarif      # for code-scanning upload
 ```
+
+## GitHub compliance
+
+`bonsai github` adds an opt-in, standard protection floor without making local
+`bonsai check` depend on network access. `init` writes a fixed `standard-v1`
+policy plus managed CI, PR-template, Dependabot, and security files. The
+generated `pull_request_target` workflow executes only protected-base Bonsai
+and treats pull-request content as analysis data.
+
+`github check` fails on missing protections and on unavailable security
+observations; it never calls uncertainty compliant. `github plan` is read-only.
+`github apply --confirm` is the only command that changes GitHub, creates or
+updates only the Bonsai-owned `bonsai-standard-v1` ruleset, and never deletes
+or weakens foreign rulesets. Give its GitHub App installation token (or a
+fine-grained fallback token) `Administration` permission. `governed-v1` adds a
+Warrant prompt for existing OpenWarrant report integration; it does not claim
+blocking authorization.
 
 ## `bonsai.toml`
 

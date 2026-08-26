@@ -6,6 +6,7 @@
 //! is its authored **home**, which may differ from where the file physically sits; that
 //! divergence is exactly the misplacement signal the leanness folds read later).
 
+use crate::github::GithubPolicy;
 use crate::model::{Kind, Node, NodeId, Plane};
 use crate::tree::Tree;
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,10 @@ pub struct Config {
     /// Conformance rules (optional) — the admission gate for new code (ADR 0134).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Rules>,
+    /// Optional remote GitHub compliance profile. Local `bonsai check` remains offline;
+    /// `bonsai github check` evaluates this profile against GitHub and managed files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubPolicy>,
     /// Per-level contracts (optional) — the architecture gate: what an addition at a level MUST
     /// do (fulfill the anchor), MUST NOT do (forbidden reach), and what seams are frozen.
     #[serde(default, rename = "contract", skip_serializing_if = "Vec::is_empty")]
@@ -276,6 +281,7 @@ impl Config {
             bonsai: meta,
             docs: None,
             rules: None,
+            github: None,
             contracts: Vec::new(),
             nodes,
         })
