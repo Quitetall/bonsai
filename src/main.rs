@@ -9,6 +9,7 @@ use bonsai::blueprint::{
 use bonsai::config::Config;
 use bonsai::facts::{facts_from_blueprint, facts_from_scip, BqlQuery, FactStore, SqliteFactStore};
 use bonsai::finding::{Finding, Location, Report, Severity};
+use bonsai::github::{self, GithubClient, GithubPolicy, Profile};
 use bonsai::model::{Kind, NodeId, Plane};
 use bonsai::moves::{plan_move, Edit, Move, MovePlan, Workspace};
 use bonsai::tree::Tree;
@@ -36,6 +37,59 @@ enum HookAction {
     Status,
     /// Remove the bonsai-managed hook.
     Uninstall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum GithubFormat {
+    Text,
+    Json,
+}
+
+#[derive(Subcommand)]
+enum GithubAction {
+    /// Scaffold an immutable standard-v1 policy and trusted GitHub workflow.
+    Init {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Canonical owner/repository identity.
+        #[arg(long)]
+        repo: String,
+        /// Add governed-v1 Warrant prompt; OpenWarrant remains report-only until qualified.
+        #[arg(long)]
+        governed: bool,
+        /// Optional GitHub user/team principals for a managed CODEOWNERS file.
+        #[arg(long = "codeowner")]
+        codeowners: Vec<String>,
+    },
+    /// Read GitHub settings and managed files. Fail/unknown is non-zero.
+    Check {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Root holding protected-base bonsai.toml policy. Defaults to --root.
+        #[arg(long)]
+        policy_root: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: GithubFormat,
+    },
+    /// Show remote drift and intended standard-v1 reconciliation without mutating GitHub.
+    Plan {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, value_enum, default_value = "text")]
+        format: GithubFormat,
+    },
+    /// Reconcile only Bonsai-owned standard-v1 settings. Requires explicit confirmation.
+    Apply {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Diagnose policy and credential discovery without contacting or changing GitHub.
+    Doctor {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -160,6 +214,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Check, scaffold, plan, and explicitly apply standard GitHub repository protections.
+    Github {
+        #[command(subcommand)]
+        action: GithubAction,
+    },
     /// Author, prove, lock, and scaffold declarative architecture shapes.
     Blueprint {
         #[command(subcommand)]
@@ -302,6 +361,7 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Github { action } => cmd_github(action),
         Cmd::Blueprint { action } => cmd_blueprint(action),
         Cmd::Graph { root, action } => cmd_graph(&root, action),
         Cmd::Init { root, force, skip } => cmd_init(&root, force, &skip),
@@ -338,6 +398,186 @@ fn main() -> Result<()> {
         Cmd::Place { file, root } => cmd_place(&root, &file),
         Cmd::Hook { action, root } => cmd_hook(&root, action),
     }
+}
+
+fn github_policy(root: &Path) -> Result<GithubPolicy> {
+    let policy = load_or_derive(root)?.github.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no [github] policy in {}; run `bonsai github init` first",
+            root.join("bonsai.toml").display()
+        )
+    })?;
+    policy.validate()?;
+    Ok(policy)
+}
+
+fn print_github_report(report: &github::ComplianceReport, format: GithubFormat) {
+    match format {
+        GithubFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".into())
+        ),
+        GithubFormat::Text => {
+            println!(
+                "GitHub compliance {} for {} ({})",
+                match report.verdict {
+                    github::Verdict::Pass => "PASS",
+                    github::Verdict::Fail => "FAIL",
+                    github::Verdict::Unknown => "UNKNOWN",
+                },
+                report.repository,
+                report.profile
+            );
+            if report.rules.is_empty() {
+                println!("  all standard-v1 controls observed");
+            }
+            for rule in &report.rules {
+                println!("  · {rule}");
+            }
+        }
+    }
+}
+
+fn add_local_github_drift(
+    report: &mut github::ComplianceReport,
+    root: &Path,
+    policy_root: &Path,
+    policy: &GithubPolicy,
+) {
+    report
+        .rules
+        .extend(github::validate_managed_files(root, policy));
+    if policy_root != root {
+        if let Some(drift) = github::candidate_policy_drift(root, policy) {
+            report.rules.push(drift);
+        }
+    }
+    github::finalize_report(report);
+}
+
+fn print_reconciliation_steps(report: &github::ComplianceReport) {
+    for rule in &report.rules {
+        let step = match rule.as_str() {
+            "github-standard-ruleset" => Some("create Bonsai-owned standard ruleset"),
+            "github-actions-enabled" | "github-actions-sha-pinning" => {
+                Some("enable Actions and require SHA-pinned actions")
+            }
+            "github-dependabot-security-updates" => Some("enable Dependabot security updates"),
+            "github-secret-scanning" => Some("enable secret scanning"),
+            "github-push-protection" => Some("enable secret-scanning push protection"),
+            rule if rule.starts_with("github-") && !rule.ends_with("-unknown") => {
+                Some("update Bonsai-owned standard ruleset after safe replacement preflight")
+            }
+            _ => None,
+        };
+        if let Some(step) = step {
+            println!("  plan: {step} ({rule})");
+        }
+    }
+}
+
+fn cmd_github(action: GithubAction) -> Result<()> {
+    match action {
+        GithubAction::Init {
+            root,
+            repo,
+            governed,
+            codeowners,
+        } => {
+            let mut policy = GithubPolicy::standard(repo);
+            if governed {
+                policy.profile = Profile::GovernedV1;
+            }
+            policy.codeowners = codeowners;
+            let created = github::init(&root, &policy)?;
+            println!(
+                "GitHub policy {} initialized for {}",
+                policy.profile.as_str(),
+                policy.repository
+            );
+            for path in created {
+                println!("  created {}", path.display());
+            }
+            println!("Next: configure BONSAI_GITHUB_APP_ID and BONSAI_GITHUB_APP_PRIVATE_KEY GitHub secrets, then run `bonsai github plan`.");
+        }
+        GithubAction::Check {
+            root,
+            policy_root,
+            format,
+        } => {
+            let policy_root = policy_root.as_deref().unwrap_or(&root);
+            let policy = github_policy(policy_root)?;
+            let client = GithubClient::from_env()?;
+            let mut report = if client.has_token() {
+                github::evaluate(&policy, &client.observe(&policy)?)
+            } else {
+                github::unknown_report(&policy, "github-auth-unknown")
+            };
+            add_local_github_drift(&mut report, &root, policy_root, &policy);
+            print_github_report(&report, format);
+            anyhow::ensure!(
+                report.verdict == github::Verdict::Pass,
+                "GitHub compliance is {:?}",
+                report.verdict
+            );
+        }
+        GithubAction::Plan { root, format } => {
+            let policy = github_policy(&root)?;
+            let client = GithubClient::from_env()?;
+            let mut report = if client.has_token() {
+                github::evaluate(&policy, &client.observe(&policy)?)
+            } else {
+                github::unknown_report(&policy, "github-auth-unknown")
+            };
+            add_local_github_drift(&mut report, &root, &root, &policy);
+            print_github_report(&report, format);
+            if report.verdict != github::Verdict::Pass {
+                print_reconciliation_steps(&report);
+                println!("No mutation performed. Reconcile with `bonsai github apply --confirm` after reviewing this plan.");
+            }
+        }
+        GithubAction::Apply { root, confirm } => {
+            anyhow::ensure!(confirm, "refusing GitHub mutation without --confirm; inspect first with `bonsai github plan`");
+            let policy = github_policy(&root)?;
+            let local_drift = github::validate_managed_files(&root, &policy);
+            anyhow::ensure!(
+                local_drift.is_empty(),
+                "refusing GitHub mutation while managed files drift: {}",
+                local_drift.join(", ")
+            );
+            let client = GithubClient::from_env()?;
+            client.apply(&policy)?;
+            let mut report = github::evaluate(&policy, &client.observe(&policy)?);
+            add_local_github_drift(&mut report, &root, &root, &policy);
+            print_github_report(&report, GithubFormat::Text);
+            anyhow::ensure!(
+                report.verdict == github::Verdict::Pass,
+                "GitHub apply completed but standard-v1 is not established"
+            );
+        }
+        GithubAction::Doctor { root } => {
+            let policy = github_policy(&root)?;
+            println!(
+                "policy: {} for {}",
+                policy.profile.as_str(),
+                policy.repository
+            );
+            println!(
+                "credential: {}",
+                if std::env::var("BONSAI_GITHUB_TOKEN").is_ok() {
+                    "BONSAI_GITHUB_TOKEN"
+                } else if std::env::var("GITHUB_TOKEN").is_ok() {
+                    "GITHUB_TOKEN"
+                } else {
+                    "missing (expected GitHub App installation token or fine-grained token)"
+                }
+            );
+            println!(
+                "GitHub App workflow secrets: BONSAI_GITHUB_APP_ID, BONSAI_GITHUB_APP_PRIVATE_KEY"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn load_blueprint(path: &Path) -> Result<Blueprint> {

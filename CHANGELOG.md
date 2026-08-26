@@ -5,6 +5,15 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — GitHub compliance
+- **GitHub compliance profiles**: `bonsai github init/check/plan/apply/doctor` establish and
+  verify `standard-v1`: protected default branch, one review, strict Bonsai check, no bypass,
+  deletion/force-push protection, SHA-pinned Actions, Dependabot, secret scanning, and push
+  protection. Local `bonsai check` remains offline.
+- **Trusted-base workflow template**: generated `pull_request_target` workflow builds public
+  Bonsai at a full pinned SHA, materializes pull-request content only as data, and fails closed on
+  missing GitHub App observation. GitHub mutation remains explicit `apply --confirm`.
+
 ### Added — repository digital twin and executable architecture
 - **Declarative blueprints** for slots, typed ports, flows, invariants, implementations, variants,
   direct compatibility adapters, fusion policy, and executable witnesses.

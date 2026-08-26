@@ -21,6 +21,7 @@ pub mod facts;
 pub mod ffi;
 pub mod finding;
 pub mod forgotten;
+pub mod github;
 pub mod graphql;
 pub mod lean;
 pub mod model;
