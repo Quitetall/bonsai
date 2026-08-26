@@ -5,6 +5,35 @@ All notable changes to Bonsai. Format loosely follows [Keep a Changelog]; versio
 
 ## [Unreleased]
 
+### Added — repository digital twin and executable architecture
+- **Declarative blueprints** for slots, typed ports, flows, invariants, implementations, variants,
+  direct compatibility adapters, fusion policy, and executable witnesses.
+- **Shape locks and semantic diffs** with content-stable BLAKE3 identities. Implementation changes
+  remain within one identity; topology/schema/invariant changes require a new identity.
+- **Transitive evolution checks** that resolve `supersedes` identities and require every historical
+  permanent-port contract to remain represented with an executable native or direct-adapter path
+  in the new shape.
+- **Typed contract scaffolding** for Rust, Python, C, and TypeScript, including schema constants,
+  input/output envelopes, implementation signatures, and contract-test surfaces. Generation is
+  non-overwriting.
+- **Automatic admission-gate integration**: `bonsai check` discovers root and `.bonsai/blueprints/`
+  contracts, validates them, fails on missing or drifting locks, and reruns the exact witness
+  contract pinned into lock schema v2.
+- **Immutable typed fact snapshots** in bundled SQLite, source provenance, mutable refs over
+  immutable history, bounded BQL dependency/impact traversal, and a read-only GraphQL projection.
+- **Repository authority discovery** for conventional blueprint and SCIP paths, enabling harnesses
+  to rebuild `main` before agent queries while leaving historical snapshots immutable.
+- **Fail-closed SCIP freshness** for current snapshots when tracked sources are newer than a
+  discovered compiler index.
+- **Katana integration** through brokered MCP tools, replay-recorded results, a native deterministic
+  Bonsai oracle, and optional data-only impact/shape-safe workflows.
+- **LamQuant production proof** locking the existing LML lossless pipeline and its typed-chain,
+  independent reference-DAG, and firmware/desktop byte-equality witnesses.
+
+### Changed
+- The framework is now Apache-2.0 licensed to support broad adoption across infrastructure,
+  production, and meta-repository ecosystems.
+
 ### Added — polyglot duplication
 - **Python function-clone detection** — the clone fold now spans `.rs` (brace-matched) *and*
   `.py` (indentation-based `def`/`async def` blocks); `Workspace::from_dir_ext` reads both. Excludes

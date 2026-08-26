@@ -3,7 +3,11 @@
 //! engine (`diff`/`apply`) is the next, hardest-part-first build.
 
 use anyhow::{Context, Result};
+use bonsai::blueprint::{
+    Blueprint, BlueprintLock, Lifecycle, ScaffoldLanguage, ShapeDiff, WitnessResult,
+};
 use bonsai::config::Config;
+use bonsai::facts::{facts_from_blueprint, facts_from_scip, BqlQuery, FactStore, SqliteFactStore};
 use bonsai::finding::{Finding, Location, Report, Severity};
 use bonsai::model::{Kind, NodeId, Plane};
 use bonsai::moves::{plan_move, Edit, Move, MovePlan, Workspace};
@@ -34,6 +38,115 @@ enum HookAction {
     Uninstall,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum BlueprintLanguage {
+    Rust,
+    Python,
+    C,
+    TypeScript,
+}
+
+impl From<BlueprintLanguage> for ScaffoldLanguage {
+    fn from(value: BlueprintLanguage) -> Self {
+        match value {
+            BlueprintLanguage::Rust => Self::Rust,
+            BlueprintLanguage::Python => Self::Python,
+            BlueprintLanguage::C => Self::C,
+            BlueprintLanguage::TypeScript => Self::TypeScript,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum BlueprintAction {
+    /// Parse and validate a declarative architecture shape.
+    Validate { blueprint: PathBuf },
+    /// Classify a change as implementation-only or a new logical shape.
+    Diff {
+        old: PathBuf,
+        new: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Execute all declared contract witnesses and save their results.
+    Verify {
+        blueprint: PathBuf,
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, default_value = "bonsai.witnesses.json")]
+        out: PathBuf,
+    },
+    /// Freeze a locked, verified architecture shape.
+    Lock {
+        blueprint: PathBuf,
+        #[arg(long)]
+        results: PathBuf,
+        #[arg(long, default_value = "bonsai.blueprint.lock.json")]
+        out: PathBuf,
+    },
+    /// Fail when a blueprint no longer matches its lock.
+    Check {
+        blueprint: PathBuf,
+        #[arg(long)]
+        lock: PathBuf,
+    },
+    /// Generate non-overwriting contract stubs for each logical slot.
+    Scaffold {
+        blueprint: PathBuf,
+        #[arg(long, value_enum)]
+        language: BlueprintLanguage,
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphAction {
+    /// Create an immutable fact snapshot from one or more architecture blueprints.
+    Snapshot {
+        #[arg(long, default_value = ".bonsai/facts.db")]
+        db: PathBuf,
+        #[arg(long)]
+        blueprint: Vec<PathBuf>,
+        /// SCIP compiler index to normalize into symbol and file dependency facts (repeatable).
+        #[arg(long)]
+        scip: Vec<PathBuf>,
+        /// Discover conventional blueprints and SCIP indices under the graph root.
+        #[arg(long)]
+        discover: bool,
+        /// When SCIP indices exist, fail if any tracked source is newer than an index.
+        #[arg(long, requires = "discover")]
+        require_fresh_scip: bool,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long = "ref", default_value = "main")]
+        reference: String,
+    },
+    /// Run a bounded Bonsai Query Language dependency or impact query.
+    Query {
+        #[arg(long, default_value = ".bonsai/facts.db")]
+        db: PathBuf,
+        #[arg(long, default_value = "main")]
+        snapshot: String,
+        #[arg(long)]
+        bql: String,
+    },
+    /// Export all typed facts in a snapshot as JSON.
+    Export {
+        #[arg(long, default_value = ".bonsai/facts.db")]
+        db: PathBuf,
+        #[arg(long, default_value = "main")]
+        snapshot: String,
+    },
+    /// Execute a read-only GraphQL query over the deterministic fact graph.
+    Graphql {
+        #[arg(long, default_value = ".bonsai/facts.db")]
+        db: PathBuf,
+        #[arg(long)]
+        query: String,
+    },
+}
+
 #[derive(Parser)]
 #[command(
     name = "bonsai",
@@ -47,6 +160,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Author, prove, lock, and scaffold declarative architecture shapes.
+    Blueprint {
+        #[command(subcommand)]
+        action: BlueprintAction,
+    },
+    /// Build and query immutable, provenance-bearing repository fact snapshots.
+    Graph {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[command(subcommand)]
+        action: GraphAction,
+    },
     /// Generate `bonsai.toml` by auto-deriving the directory capability tree.
     Init {
         #[arg(long, default_value = ".")]
@@ -177,6 +302,8 @@ enum Cmd {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
+        Cmd::Blueprint { action } => cmd_blueprint(action),
+        Cmd::Graph { root, action } => cmd_graph(&root, action),
         Cmd::Init { root, force, skip } => cmd_init(&root, force, &skip),
         Cmd::Tree { root, files, depth } => cmd_tree(&root, files, depth),
         Cmd::Stat { root, top } => cmd_stat(&root, top),
@@ -211,6 +338,351 @@ fn main() -> Result<()> {
         Cmd::Place { file, root } => cmd_place(&root, &file),
         Cmd::Hook { action, root } => cmd_hook(&root, action),
     }
+}
+
+fn load_blueprint(path: &Path) -> Result<Blueprint> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading blueprint {}", path.display()))?;
+    Blueprint::from_toml(&text).with_context(|| format!("parsing blueprint {}", path.display()))
+}
+
+fn require_valid(blueprint: &Blueprint) -> Result<()> {
+    let errors = blueprint.validate();
+    anyhow::ensure!(
+        errors.is_empty(),
+        "invalid blueprint:\n- {}",
+        errors.join("\n- ")
+    );
+    Ok(())
+}
+
+fn cmd_blueprint(action: BlueprintAction) -> Result<()> {
+    match action {
+        BlueprintAction::Validate { blueprint } => {
+            let value = load_blueprint(&blueprint)?;
+            require_valid(&value)?;
+            println!("{} {}", value.meta.id, value.shape_digest());
+        }
+        BlueprintAction::Diff { old, new, json } => {
+            let old = load_blueprint(&old)?;
+            let new = load_blueprint(&new)?;
+            require_valid(&old)?;
+            require_valid(&new)?;
+            let diff = ShapeDiff::between(&old, &new);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&diff)?);
+            } else {
+                println!(
+                    "{:?}: {} -> {}",
+                    diff.class, diff.old_digest, diff.new_digest
+                );
+            }
+        }
+        BlueprintAction::Verify {
+            blueprint,
+            root,
+            out,
+        } => {
+            let value = load_blueprint(&blueprint)?;
+            require_valid(&value)?;
+            let results = value.run_witnesses(&root);
+            std::fs::write(&out, serde_json::to_string_pretty(&results)? + "\n")
+                .with_context(|| format!("writing witness results {}", out.display()))?;
+            for result in &results {
+                println!(
+                    "{} {}{}",
+                    if result.passed { "PASS" } else { "FAIL" },
+                    result.id,
+                    if result.detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", result.detail)
+                    }
+                );
+            }
+            anyhow::ensure!(
+                results.iter().all(|result| result.passed),
+                "witnesses failed"
+            );
+        }
+        BlueprintAction::Lock {
+            blueprint,
+            results,
+            out,
+        } => {
+            let value = load_blueprint(&blueprint)?;
+            let results: Vec<WitnessResult> = serde_json::from_str(
+                &std::fs::read_to_string(&results)
+                    .with_context(|| format!("reading witness results {}", results.display()))?,
+            )?;
+            let lock = BlueprintLock::create(&value, &results)?;
+            std::fs::write(&out, lock.to_json()?)
+                .with_context(|| format!("writing blueprint lock {}", out.display()))?;
+            println!("locked {} at {}", lock.blueprint_id, lock.shape_digest);
+        }
+        BlueprintAction::Check { blueprint, lock } => {
+            let value = load_blueprint(&blueprint)?;
+            let lock = BlueprintLock::from_json(
+                &std::fs::read_to_string(&lock)
+                    .with_context(|| format!("reading blueprint lock {}", lock.display()))?,
+            )?;
+            let errors = lock.check(&value);
+            anyhow::ensure!(
+                errors.is_empty(),
+                "blueprint lock failed:\n- {}",
+                errors.join("\n- ")
+            );
+            println!("{}: locked shape intact", value.meta.id);
+        }
+        BlueprintAction::Scaffold {
+            blueprint,
+            language,
+            out,
+        } => {
+            let value = load_blueprint(&blueprint)?;
+            require_valid(&value)?;
+            let files = value.scaffold_files(language.into());
+            let existing: Vec<_> = files
+                .iter()
+                .map(|file| out.join(&file.relative_path))
+                .filter(|path| path.exists())
+                .collect();
+            anyhow::ensure!(
+                existing.is_empty(),
+                "refusing to overwrite scaffold files: {}",
+                existing
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            std::fs::create_dir_all(&out)
+                .with_context(|| format!("creating scaffold directory {}", out.display()))?;
+            for file in files {
+                let path = out.join(file.relative_path);
+                std::fs::write(&path, file.content)
+                    .with_context(|| format!("writing scaffold {}", path.display()))?;
+                println!("created {}", path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_fact_store(path: &Path) -> Result<SqliteFactStore> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating fact database directory {}", parent.display()))?;
+    }
+    SqliteFactStore::open(path).with_context(|| format!("opening fact database {}", path.display()))
+}
+
+fn rooted(root: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() || path.starts_with(root) {
+        path
+    } else {
+        root.join(path)
+    }
+}
+
+fn discover_graph_inputs(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut blueprints = std::collections::BTreeSet::new();
+    let root_blueprint = root.join("bonsai.blueprint.toml");
+    if root_blueprint.is_file() {
+        blueprints.insert(root_blueprint);
+    }
+    let blueprint_dir = root.join(".bonsai/blueprints");
+    if let Ok(entries) = std::fs::read_dir(blueprint_dir) {
+        blueprints.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("toml")),
+        );
+    }
+
+    let mut scip = std::collections::BTreeSet::new();
+    for candidate in [root.join("index.scip"), root.join(".bonsai/index.scip")] {
+        if candidate.is_file() {
+            scip.insert(candidate);
+        }
+    }
+    let index_dir = root.join(".bonsai/indexes");
+    if let Ok(entries) = std::fs::read_dir(index_dir) {
+        scip.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("scip")),
+        );
+    }
+    (blueprints.into_iter().collect(), scip.into_iter().collect())
+}
+
+fn require_fresh_scip_indices(root: &Path, indices: &[PathBuf]) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+        .context("listing tracked files for SCIP freshness")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot verify SCIP freshness because git ls-files failed"
+    );
+    let source_extension = |path: &Path| {
+        matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some(
+                "rs" | "py"
+                    | "c"
+                    | "h"
+                    | "cc"
+                    | "cpp"
+                    | "hpp"
+                    | "go"
+                    | "java"
+                    | "kt"
+                    | "kts"
+                    | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "proto"
+            )
+        )
+    };
+    let mut newest_source = None;
+    for bytes in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+    {
+        let relative = PathBuf::from(String::from_utf8_lossy(bytes).into_owned());
+        if !source_extension(&relative) {
+            continue;
+        }
+        let path = root.join(&relative);
+        let modified = std::fs::metadata(&path)
+            .with_context(|| format!("reading tracked source metadata {}", path.display()))?
+            .modified()
+            .with_context(|| format!("reading tracked source mtime {}", path.display()))?;
+        let replace = match &newest_source {
+            None => true,
+            Some((_, newest)) => modified > *newest,
+        };
+        if replace {
+            newest_source = Some((relative, modified));
+        }
+    }
+    let Some((source, source_time)) = newest_source else {
+        return Ok(());
+    };
+    for index in indices {
+        let path = rooted(root, index.clone());
+        let modified = std::fs::metadata(&path)
+            .with_context(|| format!("reading SCIP index metadata {}", path.display()))?
+            .modified()
+            .with_context(|| format!("reading SCIP index mtime {}", path.display()))?;
+        anyhow::ensure!(
+            modified >= source_time,
+            "SCIP index '{}' is stale: tracked source '{}' is newer; regenerate compiler indices before querying current code facts",
+            path.display(),
+            source.display()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_graph(root: &Path, action: GraphAction) -> Result<()> {
+    match action {
+        GraphAction::Snapshot {
+            db,
+            mut blueprint,
+            mut scip,
+            discover,
+            require_fresh_scip,
+            parent,
+            reference,
+        } => {
+            if discover {
+                let (found_blueprints, found_scip) = discover_graph_inputs(root);
+                blueprint.extend(found_blueprints);
+                scip.extend(found_scip);
+                blueprint.sort();
+                blueprint.dedup();
+                scip.sort();
+                scip.dedup();
+            }
+            if require_fresh_scip && !scip.is_empty() {
+                require_fresh_scip_indices(root, &scip)?;
+            }
+            anyhow::ensure!(
+                !blueprint.is_empty() || !scip.is_empty(),
+                "graph snapshot needs --discover or at least one --blueprint/--scip input"
+            );
+            let store = open_fact_store(&rooted(root, db))?;
+            let parent_id = parent
+                .as_deref()
+                .map(|value| store.resolve_snapshot(value))
+                .transpose()?;
+            let mut facts = Vec::new();
+            for path in blueprint {
+                let path = rooted(root, path);
+                let value = load_blueprint(&path)?;
+                require_valid(&value)?;
+                let locator = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+                facts.extend(facts_from_blueprint(&value, &locator));
+            }
+            for path in scip {
+                let path = rooted(root, path);
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("reading SCIP index {}", path.display()))?;
+                let digest = format!("b3:{}", blake3::hash(&bytes).to_hex());
+                let graph = bonsai::scip::CodeGraph::from_file(&path)
+                    .with_context(|| format!("parsing SCIP index {}", path.display()))?;
+                let locator = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+                facts.extend(facts_from_scip(&graph, &locator, &digest));
+            }
+            let snapshot = store.create_snapshot(parent_id.as_deref(), &facts)?;
+            store.set_ref(&reference, &snapshot.id)?;
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        GraphAction::Query { db, snapshot, bql } => {
+            let store = open_fact_store(&rooted(root, db))?;
+            let snapshot = store.resolve_snapshot(&snapshot)?;
+            let query = BqlQuery::parse(&bql)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.query(&snapshot, &query)?)?
+            );
+        }
+        GraphAction::Export { db, snapshot } => {
+            let store = open_fact_store(&rooted(root, db))?;
+            let snapshot = store.resolve_snapshot(&snapshot)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&store.facts(&snapshot)?)?
+            );
+        }
+        GraphAction::Graphql { db, query } => {
+            let store = open_fact_store(&rooted(root, db))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&bonsai::graphql::execute_query(store, &query))?
+            );
+        }
+    }
+    Ok(())
 }
 
 const HOOK_MARK: &str = "# bonsai-managed pre-commit hook";
@@ -960,6 +1432,8 @@ fn cmd_lean(root: &Path, save: bool, cache: bool, format: Format) -> Result<()> 
 const GLOBAL_RULES: &[&str] = &[
     "tree-invariant",
     "leanness-ratchet",
+    "blueprint-lock",
+    "blueprint-evolution",
     "abstraction-layers",
     "abstraction-depth",
 ];
@@ -999,6 +1473,177 @@ fn changed_files(
         set.extend(run(&["diff", "--name-only", r]));
     }
     Some(set)
+}
+
+fn blueprint_binding_errors(root: &Path, blueprint: &Blueprint) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut check = |kind: &str, id: &str, binding: &str| {
+        let Some((file, symbol)) = binding.split_once('#') else {
+            errors.push(format!(
+                "{kind} '{id}': binding '{binding}' must use <repo-path>#<symbol>"
+            ));
+            return;
+        };
+        if file.trim().is_empty() || symbol.trim().is_empty() {
+            errors.push(format!(
+                "{kind} '{id}': binding '{binding}' must name both a file and symbol"
+            ));
+            return;
+        }
+        let path = rooted(root, PathBuf::from(file));
+        if !path.is_file() {
+            errors.push(format!(
+                "{kind} '{id}': binding file '{}' does not exist",
+                path.display()
+            ));
+        }
+    };
+    for implementation in &blueprint.implementations {
+        for binding in &implementation.bindings {
+            check("implementation", &implementation.id, binding);
+        }
+    }
+    for adapter in &blueprint.adapters {
+        check("adapter", &adapter.id, &adapter.binding);
+    }
+    errors.sort();
+    errors.dedup();
+    errors
+}
+
+fn check_blueprint_locks(root: &Path) -> Vec<Finding> {
+    let mut paths = Vec::new();
+    let root_blueprint = root.join("bonsai.blueprint.toml");
+    if root_blueprint.exists() {
+        paths.push(root_blueprint);
+    }
+    let directory = root.join(".bonsai/blueprints");
+    if let Ok(entries) = std::fs::read_dir(&directory) {
+        paths.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("toml")),
+        );
+    }
+    paths.sort();
+
+    let mut findings = Vec::new();
+    let mut loaded = std::collections::BTreeMap::<String, (String, Blueprint)>::new();
+    for path in paths {
+        let relative = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let blueprint = match load_blueprint(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                findings.push(Finding::new(
+                    "blueprint-lock",
+                    Severity::Error,
+                    error.to_string(),
+                    Location::file(&relative),
+                ));
+                continue;
+            }
+        };
+        if loaded
+            .insert(
+                blueprint.meta.id.clone(),
+                (relative.clone(), blueprint.clone()),
+            )
+            .is_some()
+        {
+            findings.push(Finding::new(
+                "blueprint-evolution",
+                Severity::Error,
+                format!("duplicate blueprint identity '{}'", blueprint.meta.id),
+                Location::file(&relative),
+            ));
+        }
+        let validation = blueprint.validate();
+        for error in validation
+            .into_iter()
+            .chain(blueprint_binding_errors(root, &blueprint))
+        {
+            findings.push(Finding::new(
+                "blueprint-lock",
+                Severity::Error,
+                error,
+                Location::file(&relative),
+            ));
+        }
+        if blueprint.meta.lifecycle != Lifecycle::Locked {
+            continue;
+        }
+        let lock_path = path.with_extension("lock.json");
+        let lock = std::fs::read_to_string(&lock_path)
+            .with_context(|| format!("reading required lock {}", lock_path.display()))
+            .and_then(|text| BlueprintLock::from_json(&text));
+        match lock {
+            Ok(lock) => {
+                let lock_errors = lock.check(&blueprint);
+                for error in &lock_errors {
+                    findings.push(Finding::new(
+                        "blueprint-lock",
+                        Severity::Error,
+                        error.clone(),
+                        Location::file(&relative),
+                    ));
+                }
+                // Execute only the exact witness contract authorized by the lock. A changed
+                // command is rejected above before repository-authored shell is invoked.
+                if lock_errors.is_empty() {
+                    for result in blueprint
+                        .run_witnesses(root)
+                        .into_iter()
+                        .filter(|result| !result.passed)
+                    {
+                        findings.push(Finding::new(
+                            "blueprint-lock",
+                            Severity::Error,
+                            format!("witness '{}' failed: {}", result.id, result.detail),
+                            Location::file(&relative),
+                        ));
+                    }
+                }
+            }
+            Err(error) => findings.push(Finding::new(
+                "blueprint-lock",
+                Severity::Error,
+                error.to_string(),
+                Location::file(&relative),
+            )),
+        }
+    }
+    for (relative, blueprint) in loaded.values() {
+        let Some(previous_id) = blueprint.meta.supersedes.as_deref() else {
+            continue;
+        };
+        match loaded.get(previous_id) {
+            Some((_, previous)) => {
+                for error in Blueprint::validate_evolution(previous, blueprint) {
+                    findings.push(Finding::new(
+                        "blueprint-evolution",
+                        Severity::Error,
+                        error,
+                        Location::file(relative),
+                    ));
+                }
+            }
+            None => findings.push(Finding::new(
+                "blueprint-evolution",
+                Severity::Error,
+                format!(
+                    "superseded blueprint '{}' is not present; retain historical shapes in .bonsai/blueprints",
+                    previous_id
+                ),
+                Location::file(relative),
+            )),
+        }
+    }
+    findings
 }
 
 fn cmd_check(
@@ -1062,7 +1707,11 @@ fn cmd_check(
         findings.extend(bonsai::contracts::evaluate(&ws, &cfg.contracts));
     }
 
-    // 5. the migration valve: grandfather declared/in-flight exceptions (allow-list) so an
+    // 5. conventionally discovered shape locks make the existing hook and CI command protect
+    //    declarative architecture without requiring a second gate.
+    findings.extend(check_blueprint_locks(root));
+
+    // 6. the migration valve: grandfather declared/in-flight exceptions (allow-list) so an
     //    intentional change doesn't fight the gate — but report what was exempted (never silent).
     let exempted = if let Some(allow) = cfg.rules.as_ref().map(|r| &r.allow) {
         let (kept, exempted) = bonsai::rules::apply_allow(findings, allow);
@@ -1072,11 +1721,11 @@ fn cmd_check(
         Vec::new()
     };
 
-    // 6. inline `// bonsai:allow` — the line-level valve for a genuine false positive at source.
+    // 7. inline `// bonsai:allow` — the line-level valve for a genuine false positive at source.
     let (kept, suppressed) = bonsai::rules::apply_inline_suppression(root, findings);
     findings = kept;
 
-    // 7. diff-scoping: with --staged/--since, keep only findings on changed files (plus the
+    // 8. diff-scoping: with --staged/--since, keep only findings on changed files (plus the
     //    repo-wide gates), so the pre-commit hook judges the addition, not pre-existing debt.
     let scoped = changed_files(root, staged, since);
     if let Some(changed) = &scoped {
